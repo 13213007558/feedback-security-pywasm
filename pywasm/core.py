@@ -5,6 +5,7 @@ import pywasm.arith
 import pywasm.leb128
 import pywasm.log
 import pywasm.opcode
+import pywasm.quota
 import struct
 import typing
 
@@ -1417,6 +1418,8 @@ class ModuleInst:
         self.elem: list[int] = []
         self.data: list[int] = []
         self.exps: list[ExportInst] = []
+        # The task this instance is bound to for quota attribution, if the runtime uses a quota ledger.
+        self.task: pywasm.quota.Task | None = None
 
 
 class FuncInst:
@@ -1559,16 +1562,54 @@ class Machine:
     def __init__(self) -> None:
         self.store = Store()
         self.stack = Stack()
+        # Optional quota ledger attributing memory to tasks. None disables accounting.
+        self.ledger: pywasm.quota.Ledger | None = None
 
     def allocate(
         self,
         module: ModuleDesc,
         extern: list[Extern],
         globin: list[ValInst],
-        elemin: list[list[ValInst]]
+        elemin: list[list[ValInst]],
+        task: pywasm.quota.Task | None = None,
+    ) -> ModuleInst:
+        # Snapshot the store so a quota denial can roll back to a consistent state.
+        ledger = self.ledger if task is not None else None
+        mark = [len(self.store.func), len(self.store.tabl), len(self.store.mems),
+                len(self.store.glob), len(self.store.elem), len(self.store.data)]
+        charged: list[MemInst] = []
+        attached: list[MemInst] = []
+        try:
+            inst = self.allocate_inner(module, extern, globin, elemin, task, ledger, charged, attached)
+        except Exception:
+            if ledger is not None:
+                for mem in attached:
+                    ledger.mem_detach(task, mem)
+                for mem in charged:
+                    ledger.mem_uncharge(task, mem)
+            self.store.func = self.store.func[:mark[0]]
+            self.store.tabl = self.store.tabl[:mark[1]]
+            self.store.mems = self.store.mems[:mark[2]]
+            self.store.glob = self.store.glob[:mark[3]]
+            self.store.elem = self.store.elem[:mark[4]]
+            self.store.data = self.store.data[:mark[5]]
+            raise
+        return inst
+
+    def allocate_inner(
+        self,
+        module: ModuleDesc,
+        extern: list[Extern],
+        globin: list[ValInst],
+        elemin: list[list[ValInst]],
+        task: pywasm.quota.Task | None,
+        ledger: pywasm.quota.Ledger | None,
+        charged: list[MemInst],
+        attached: list[MemInst],
     ) -> ModuleInst:
         inst = ModuleInst()
         inst.type = module.type
+        inst.task = task
         for e in extern:
             match e.kind:
                 case 0x00:
@@ -1577,6 +1618,12 @@ class Machine:
                     inst.tabl.append(e.data)
                 case 0x02:
                     inst.mems.append(e.data)
+                    if ledger is not None:
+                        # An imported memory is shared: it must be explicitly approved for the task and is
+                        # not charged again, since its bytes are already attributed to their contributors.
+                        mem = self.store.mems[e.data]
+                        ledger.mem_attach(task, mem)
+                        attached.append(mem)
                 case 0x03:
                     inst.glob.append(e.data)
         for _, e in enumerate(module.func):
@@ -1588,6 +1635,11 @@ class Machine:
         for _, e in enumerate(module.mems):
             addr = self.store.allocate_memory(e)
             inst.mems.append(addr)
+            if ledger is not None:
+                # A module-defined memory is exclusive to the task: charge its initial size.
+                mem = self.store.mems[addr]
+                ledger.mem_create(task, mem)
+                charged.append(mem)
         for i, e in enumerate(module.glob):
             addr = self.store.allocate_global(e.type, globin[i])
             inst.glob.append(addr)
@@ -1611,7 +1663,7 @@ class Machine:
             inst.exps.append(expi)
         return inst
 
-    def instance(self, module: ModuleDesc, extern: list[Extern]) -> ModuleInst:
+    def instance(self, module: ModuleDesc, extern: list[Extern], task: pywasm.quota.Task | None = None) -> ModuleInst:
         assert len(module.imps) == len(extern)
         for a, b in zip(module.imps, extern):
             assert a.kind == b.kind
@@ -1655,7 +1707,7 @@ class Machine:
                 l.append(rets)
             elemin.append(l)
         self.stack.frame.pop()
-        newmod = self.allocate(module, extern, globin, elemin)
+        newmod = self.allocate(module, extern, globin, elemin, task)
         assert newmod.func == auxmod.func
         self.stack.frame.append(Frame(newmod, LocalsInst([]), 0, 0, 0))
         for i, e in enumerate(module.elem):
@@ -2007,7 +2059,15 @@ class Machine:
                     # Limit memory size to 64m.
                     cnda = size + incr <= 1024
                     cndb = mems.type.limits.m == 0 or size + incr <= mems.type.limits.m
-                    if cnda and cndb:
+                    task = frame.module.task
+                    cndc = True
+                    if self.ledger is not None and task is not None:
+                        # The grow delta is charged to the growing instance's task. On denial the memory,
+                        # the quota, and every permission stay exactly as they were.
+                        cndc = self.ledger.mem_can_grow(task, mems, incr)
+                    if cnda and cndb and cndc:
+                        if self.ledger is not None and task is not None:
+                            self.ledger.mem_grow(task, mems, incr)
                         rets = size
                         mems.grow(incr)
                     self.stack.value.append(ValInst.from_i32(rets))
@@ -4124,9 +4184,12 @@ class Machine:
 class Runtime:
     # A webassembly runtime manages Store, stack, and other runtime structure. They forming the WebAssembly abstract.
 
-    def __init__(self) -> None:
+    def __init__(self, ledger: pywasm.quota.Ledger | None = None) -> None:
         self.machine = Machine()
         self.imports: dict[str, dict[str, Extern]] = {}
+        # Optional quota ledger shared by every instance hosted in this runtime.
+        self.ledger = ledger
+        self.machine.ledger = ledger
 
     def allocate_func_host(self, type: FuncType, func: typing.Callable) -> Extern:
         # Allocate new instances of host functions.
@@ -4137,8 +4200,16 @@ class Runtime:
         # Allocate new instances of tables.
         return Extern(0x01, self.machine.store.allocate_table(type))
 
-    def allocate_memory(self, type: MemType) -> Extern:
+    def allocate_memory(self, type: MemType, task: pywasm.quota.Task | None = None) -> Extern:
         # Allocate new instances of memory.
+        # When a task is given and the runtime has a quota ledger, the initial size is charged to the task; a
+        # quota denial raises QuotaExceeded and leaves the store unchanged.
+        if self.ledger is not None and task is not None:
+            inst = MemInst(type)
+            self.ledger.mem_create(task, inst)
+            addr = len(self.machine.store.mems)
+            self.machine.store.mems.append(inst)
+            return Extern(0x02, addr)
         return Extern(0x02, self.machine.store.allocate_memory(type))
 
     def allocate_global(self, type: GlobalType, data: ValInst) -> Extern:
@@ -4159,16 +4230,31 @@ class Runtime:
         addr = inst.data
         return self.machine.store.glob[addr]
 
-    def instance(self, module: ModuleDesc) -> ModuleInst:
+    def instance(self, module: ModuleDesc, task: pywasm.quota.Task | None = None) -> ModuleInst:
         # A module is instantiated with a list of external values supplying the required imports. Instantiation checks
         # that the module is valid and the provided imports match the declared types, and may fail with an error
         # otherwise. Instantiation can also result in a trap from initializing a table or memory from an active
         # segment or from executing the start function. It is up to the embedder to define how such conditions are
         # reported.
+        #
+        # When a task is given and the runtime has a quota ledger, the instance is bound to the task: memories
+        # defined by the module are charged to it, imported memories must be explicitly approved for it, and a
+        # quota denial rolls the store back to its previous state.
         extern: list[Extern] = []
         for e in module.imps:
             extern.append(self.imports[e.module][e.name])
-        return self.machine.instance(module, extern)
+        return self.machine.instance(module, extern, task)
+
+    def host_buffer(self, task: pywasm.quota.Task, size: int, label: str = '') -> pywasm.quota.HostBuffer:
+        # Allocate a host-side buffer charged to a task's quota.
+        assert self.ledger is not None, 'host buffers require a runtime with a quota ledger'
+        return self.ledger.host_alloc(task, size, label)
+
+    def end_task(self, task: pywasm.quota.Task) -> pywasm.quota.Report:
+        # End a task: free its exclusive memories, release its host buffers, and transfer its contributions to
+        # shared memories that surviving tasks still reference. Returns a report of who released what.
+        assert self.ledger is not None, 'end_task requires a runtime with a quota ledger'
+        return self.ledger.end_task(task)
 
     def instance_from_file(self, path: str) -> ModuleInst:
         # Instantiated a module from a local file.
