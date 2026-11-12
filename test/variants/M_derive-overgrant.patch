@@ -1,0 +1,12 @@
+diff --git a/pywasm/wasi.py b/pywasm/wasi.py
+index f983281..f867dfc 100644
+--- a/pywasm/wasi.py
++++ b/pywasm/wasi.py
+@@ -1203,6 +1203,7 @@ class Preview1:
+                 return [self.ERRNO_LOOP]
+             raise e
+         rights_base = args[5]
++        rights_base |= self.RIGHTS_FD_WRITE
+         rights_root = args[6]
+         # Drectory does not have the seek right.
+         if os.path.isdir(host_fd):

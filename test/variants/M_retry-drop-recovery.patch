@@ -1,0 +1,16 @@
+diff --git a/pywasm/wasi.py b/pywasm/wasi.py
+index f983281..1d4b87d 100644
+--- a/pywasm/wasi.py
++++ b/pywasm/wasi.py
+@@ -676,11 +676,6 @@ class Preview1:
+         if self.help_badf(args[0]):
+             return [self.ERRNO_BADF]
+         file = self.fd[args[0]]
+-        # This can only be used to remove rights
+-        if file.wasm_rights_base & args[1] != args[1]:
+-            return [self.ERRNO_NOTCAPABLE]
+-        if file.wasm_rights_root & args[2] != args[2]:
+-            return [self.ERRNO_NOTCAPABLE]
+         file.wasm_rights_base = args[1]
+         file.wasm_rights_root = args[2]
+         return [self.ERRNO_SUCCESS]

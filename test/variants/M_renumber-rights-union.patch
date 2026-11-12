@@ -1,0 +1,22 @@
+diff --git a/pywasm/wasi.py b/pywasm/wasi.py
+index f983281..5dcf48c 100644
+--- a/pywasm/wasi.py
++++ b/pywasm/wasi.py
+@@ -682,7 +682,7 @@ class Preview1:
+         if file.wasm_rights_root & args[2] != args[2]:
+             return [self.ERRNO_NOTCAPABLE]
+         file.wasm_rights_base = args[1]
+-        file.wasm_rights_root = args[2]
++        file.wasm_rights_root = args[2] | (file.wasm_rights_base & ~args[1])
+         return [self.ERRNO_SUCCESS]
+ 
+     def fd_filestat_get(self, m: pywasm.core.Machine, args: list[int]) -> list[int]:
+@@ -889,7 +889,7 @@ class Preview1:
+         dest.wasm_fd = stem.wasm_fd
+         dest.wasm_flag = stem.wasm_flag
+         dest.wasm_name = stem.wasm_name
+-        dest.wasm_rights_base = stem.wasm_rights_base
++        dest.wasm_rights_base = stem.wasm_rights_base | (dest.wasm_rights_root & ~stem.wasm_rights_root)
+         dest.wasm_rights_root = stem.wasm_rights_root
+         dest.wasm_status = stem.wasm_status
+         dest.wasm_type = stem.wasm_type
