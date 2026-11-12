@@ -57,8 +57,40 @@ $ python script/build_wasi.py # Download wasi tests at res/wasi-testsuite.
 
 $ python test/example.py      # Test example.
 $ python test/main.py         # Test main.
+$ python test/budget.py       # Test resource budgets.
 $ python test/spec.py         # Test spec.
 $ python test/wasi.py         # Test wasi.
+```
+
+# Resource budget
+
+Untrusted modules can be capped before they are decoded or instantiated by passing a
+`Budget` to the `instance*` entry points. Three independent limits are enforced across
+both phases; a `None` limit means unlimited, and omitting the budget keeps the historical
+behavior unchanged.
+
+- `input_bytes`: every byte is reserved against the limit before it is read, so an
+  oversized section is rejected without being buffered.
+- `struct_entries`: structural items (types, functions, globals, exports, elements,
+  data segments, locals and instructions) are reserved before their objects are built.
+- `planned_allocations`: the runtime objects admission would create are reserved up
+  front, including one unit per store entry plus one per memory page and table element.
+
+When a limit is crossed, `pywasm.BudgetExceeded` is raised with a stable `reason` taken
+from `pywasm.Reason` (`input_bytes_exceeded`, `struct_entries_exceeded`,
+`planned_allocations_exceeded`). Rejections happen before the offending structure is
+created, and any store entries already built during a failed admission are rolled back.
+
+```py
+import pywasm
+
+budget = pywasm.Budget(input_bytes=1 << 20, struct_entries=10_000,
+                       planned_allocations=100_000)
+runtime = pywasm.core.Runtime()
+try:
+    module = runtime.instance_from_file('untrusted.wasm', budget)
+except pywasm.BudgetExceeded as e:
+    print(f'rejected: {e.reason} (used={e.used}, requested={e.requested})')
 ```
 
 # Performance

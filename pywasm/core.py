@@ -2,11 +2,18 @@ import ctypes
 import io
 import math
 import pywasm.arith
+import pywasm.budget
 import pywasm.leb128
 import pywasm.log
 import pywasm.opcode
 import struct
 import typing
+
+
+def _charge_entry(budget: 'pywasm.budget.Budget | None', n: int = 1) -> None:
+    # Reserve structural entries during decoding; a missing budget means unlimited.
+    if budget is not None:
+        budget.charge_entry(n)
 
 
 class ValType:
@@ -367,7 +374,9 @@ class Inst:
                 e.into_disasm(indent + 4)
 
     @classmethod
-    def from_reader(cls, r: io.IOBase) -> typing.Self:
+    def from_reader(
+        cls, r: io.IOBase, budget: 'pywasm.budget.Budget | None' = None
+    ) -> typing.Self:
         b = ord(r.read(1))
         if b >= 0xfc:
             e = pywasm.leb128.u.encode(pywasm.leb128.u.decode_reader(r)[0])
@@ -379,17 +388,19 @@ class Inst:
                 o.args.append(Bype.from_reader(r))
                 o.args.append([])
                 for _ in range(1 << 32):
-                    i = cls.from_reader(r)
+                    i = cls.from_reader(r, budget)
                     if i.opcode == pywasm.opcode.end:
                         break
+                    _charge_entry(budget)
                     o.args[1].append(i)
             case pywasm.opcode.loop:
                 o.args.append(Bype.from_reader(r))
                 o.args.append([])
                 for _ in range(1 << 32):
-                    i = cls.from_reader(r)
+                    i = cls.from_reader(r, budget)
                     if i.opcode == pywasm.opcode.end:
                         break
+                    _charge_entry(budget)
                     o.args[1].append(i)
             case pywasm.opcode.if_then:
                 o.args.append(Bype.from_reader(r))
@@ -397,19 +408,22 @@ class Inst:
                 o.args.append([])
                 argidx = 1
                 for _ in range(1 << 32):
-                    i = cls.from_reader(r)
+                    i = cls.from_reader(r, budget)
                     if i.opcode == pywasm.opcode.end:
                         break
                     if i.opcode == pywasm.opcode.else_fi:
                         argidx = 2
                         continue
+                    _charge_entry(budget)
                     o.args[argidx].append(i)
             case pywasm.opcode.br:
                 o.args.append(pywasm.leb128.u.decode_reader(r)[0])
             case pywasm.opcode.br_if:
                 o.args.append(pywasm.leb128.u.decode_reader(r)[0])
             case pywasm.opcode.br_table:
-                o.args.append([pywasm.leb128.u.decode_reader(r)[0] for _ in range(pywasm.leb128.u.decode_reader(r)[0])])
+                n = pywasm.leb128.u.decode_reader(r)[0]
+                _charge_entry(budget, n)
+                o.args.append([pywasm.leb128.u.decode_reader(r)[0] for _ in range(n)])
                 o.args.append(pywasm.leb128.u.decode_reader(r)[0])
             case pywasm.opcode.call:
                 o.args.append(pywasm.leb128.u.decode_reader(r)[0])
@@ -417,7 +431,9 @@ class Inst:
                 o.args.append(pywasm.leb128.u.decode_reader(r)[0])
                 o.args.append(pywasm.leb128.u.decode_reader(r)[0])
             case pywasm.opcode.select_type:
-                o.args.append([pywasm.leb128.u.decode_reader(r)[0] for _ in range(pywasm.leb128.u.decode_reader(r)[0])])
+                n = pywasm.leb128.u.decode_reader(r)[0]
+                _charge_entry(budget, n)
+                o.args.append([pywasm.leb128.u.decode_reader(r)[0] for _ in range(n)])
             case pywasm.opcode.local_get:
                 o.args.append(pywasm.leb128.u.decode_reader(r)[0])
             case pywasm.opcode.local_set:
@@ -728,12 +744,15 @@ class Expr:
             e.into_disasm(indent)
 
     @classmethod
-    def from_reader(cls, r: io.IOBase) -> typing.Self:
+    def from_reader(
+        cls, r: io.IOBase, budget: 'pywasm.budget.Budget | None' = None
+    ) -> typing.Self:
         s = []
         for _ in range(1 << 32):
-            i = Inst.from_reader(r)
+            i = Inst.from_reader(r, budget)
             if i.opcode == pywasm.opcode.end:
                 break
+            _charge_entry(budget)
             s.append(i)
         return cls(s)
 
@@ -782,11 +801,13 @@ class FuncType:
         return f'{self.args} -> {self.rets}'
 
     @classmethod
-    def from_reader(cls, r: io.IOBase) -> typing.Self:
+    def from_reader(cls, r: io.IOBase, budget: 'pywasm.budget.Budget | None' = None) -> typing.Self:
         assert ord(r.read(1)) == 0x60
         n = pywasm.leb128.u.decode_reader(r)[0]
+        _charge_entry(budget, n)
         args = [ValType.from_reader(r) for _ in range(n)]
         n = pywasm.leb128.u.decode_reader(r)[0]
+        _charge_entry(budget, n)
         rets = [ValType.from_reader(r) for _ in range(n)]
         return cls(args, rets)
 
@@ -816,8 +837,16 @@ class FuncDesc:
         return cls(pywasm.leb128.u.decode_reader(r)[0], [], Expr([]))
 
     @classmethod
-    def from_reader_code(cls, r: io.IOBase) -> typing.Self:
-        return cls(0, [LocalsDesc.from_reader(r) for _ in range(pywasm.leb128.u.decode_reader(r)[0])], Expr.from_reader(r))
+    def from_reader_code(
+        cls, r: io.IOBase, budget: 'pywasm.budget.Budget | None' = None
+    ) -> typing.Self:
+        n = pywasm.leb128.u.decode_reader(r)[0]
+        locals = []
+        for _ in range(n):
+            desc = LocalsDesc.from_reader(r)
+            _charge_entry(budget, desc.n)
+            locals.append(desc)
+        return cls(0, locals, Expr.from_reader(r, budget))
 
 
 class Limits:
@@ -1006,8 +1035,10 @@ class GlobalDesc:
         return repr(self.type)
 
     @classmethod
-    def from_reader(cls, r: io.IOBase) -> typing.Self:
-        return cls(GlobalType.from_reader(r), Expr.from_reader(r))
+    def from_reader(
+        cls, r: io.IOBase, budget: 'pywasm.budget.Budget | None' = None
+    ) -> typing.Self:
+        return cls(GlobalType.from_reader(r), Expr.from_reader(r, budget))
 
 
 class GlobalInst:
@@ -1033,7 +1064,9 @@ class Custom:
         self.data = data
 
     @classmethod
-    def from_reader(cls, r: io.IOBase) -> typing.Self:
+    def from_reader(
+        cls, r: io.IOBase, budget: 'pywasm.budget.Budget | None' = None
+    ) -> typing.Self:
         n = pywasm.leb128.u.decode_reader(r)[0]
         return cls(r.read(n).decode(), bytearray(r.read(-1)))
 
@@ -1063,7 +1096,9 @@ class Import:
         return f'{self.module}.{self.name} {kind} {self.desc}'
 
     @classmethod
-    def from_reader(cls, r: io.IOBase) -> typing.Self:
+    def from_reader(
+        cls, r: io.IOBase, budget: 'pywasm.budget.Budget | None' = None
+    ) -> typing.Self:
         n = pywasm.leb128.u.decode_reader(r)[0]
         module = r.read(n).decode()
         n = pywasm.leb128.u.decode_reader(r)[0]
@@ -1071,9 +1106,9 @@ class Import:
         type = ord(r.read(1))
         desc = {
             0x00: lambda r: pywasm.leb128.u.decode_reader(r)[0],
-            0x01: TableType.from_reader,
-            0x02: MemType.from_reader,
-            0x03: GlobalType.from_reader,
+            0x01: lambda r: TableType.from_reader(r),
+            0x02: lambda r: MemType.from_reader(r),
+            0x03: lambda r: GlobalType.from_reader(r),
         }[type](r)
         return cls(module, name, type, desc)
 
@@ -1120,7 +1155,9 @@ class ExportDesc:
         return f'{self.name} {type_name} {self.desc}'
 
     @classmethod
-    def from_reader(cls, r: io.IOBase) -> typing.Self:
+    def from_reader(
+        cls, r: io.IOBase, budget: 'pywasm.budget.Budget | None' = None
+    ) -> typing.Self:
         name = bytearray(r.read(pywasm.leb128.u.decode_reader(r)[0])).decode()
         kind = ord(r.read(1))
         desc = pywasm.leb128.u.decode_reader(r)[0]
@@ -1157,7 +1194,9 @@ class ElemDesc:
         return f'{self.tidx}'
 
     @classmethod
-    def from_reader(cls, r: io.IOBase) -> typing.Self:
+    def from_reader(
+        cls, r: io.IOBase, budget: 'pywasm.budget.Budget | None' = None
+    ) -> typing.Self:
         kind = pywasm.leb128.u.decode_reader(r)[0]
         type = ValType.ref_func()
         tidx = 0
@@ -1165,52 +1204,68 @@ class ElemDesc:
         init = []
         match kind:
             case 0x00:
-                offset = Expr.from_reader(r)
-                for _ in range(pywasm.leb128.u.decode_reader(r)[0]):
+                offset = Expr.from_reader(r, budget)
+                n = pywasm.leb128.u.decode_reader(r)[0]
+                _charge_entry(budget, n)
+                for _ in range(n):
                     fidx = pywasm.leb128.u.decode_reader(r)[0]
                     expr = Expr([Inst(pywasm.opcode.ref_func, [fidx])])
                     init.append(expr)
             case 0x01:
                 assert ord(r.read(1)) == 0x00
-                for _ in range(pywasm.leb128.u.decode_reader(r)[0]):
+                n = pywasm.leb128.u.decode_reader(r)[0]
+                _charge_entry(budget, n)
+                for _ in range(n):
                     fidx = pywasm.leb128.u.decode_reader(r)[0]
                     expr = Expr([Inst(pywasm.opcode.ref_func, [fidx])])
                     init.append(expr)
             case 0x02:
                 tidx = pywasm.leb128.u.decode_reader(r)[0]
-                offset = Expr.from_reader(r)
+                offset = Expr.from_reader(r, budget)
                 assert ord(r.read(1)) == 0x00
-                for _ in range(pywasm.leb128.u.decode_reader(r)[0]):
+                n = pywasm.leb128.u.decode_reader(r)[0]
+                _charge_entry(budget, n)
+                for _ in range(n):
                     fidx = pywasm.leb128.u.decode_reader(r)[0]
                     expr = Expr([Inst(pywasm.opcode.ref_func, [fidx])])
                     init.append(expr)
             case 0x03:
                 assert ord(r.read(1)) == 0x00
-                for _ in range(pywasm.leb128.u.decode_reader(r)[0]):
+                n = pywasm.leb128.u.decode_reader(r)[0]
+                _charge_entry(budget, n)
+                for _ in range(n):
                     fidx = pywasm.leb128.u.decode_reader(r)[0]
                     expr = Expr([Inst(pywasm.opcode.ref_func, [fidx])])
                     init.append(expr)
             case 0x04:
-                offset = Expr.from_reader(r)
-                for _ in range(pywasm.leb128.u.decode_reader(r)[0]):
-                    expr = Expr.from_reader(r)
+                offset = Expr.from_reader(r, budget)
+                n = pywasm.leb128.u.decode_reader(r)[0]
+                _charge_entry(budget, n)
+                for _ in range(n):
+                    expr = Expr.from_reader(r, budget)
                     init.append(expr)
             case 0x05:
                 type = ValType.from_reader(r)
-                for _ in range(pywasm.leb128.u.decode_reader(r)[0]):
-                    expr = Expr.from_reader(r)
+                n = pywasm.leb128.u.decode_reader(r)[0]
+                _charge_entry(budget, n)
+                for _ in range(n):
+                    expr = Expr.from_reader(r, budget)
                     init.append(expr)
             case 0x06:
                 tidx = pywasm.leb128.u.decode_reader(r)[0]
-                offset = Expr.from_reader(r)
+                offset = Expr.from_reader(r, budget)
                 type = ValType.from_reader(r)
-                for _ in range(pywasm.leb128.u.decode_reader(r)[0]):
-                    expr = Expr.from_reader(r)
+                n = pywasm.leb128.u.decode_reader(r)[0]
+                _charge_entry(budget, n)
+                for _ in range(n):
+                    expr = Expr.from_reader(r, budget)
                     init.append(expr)
             case 0x07:
                 type = ValType.from_reader(r)
-                for _ in range(pywasm.leb128.u.decode_reader(r)[0]):
-                    expr = Expr.from_reader(r)
+                n = pywasm.leb128.u.decode_reader(r)[0]
+                _charge_entry(budget, n)
+                for _ in range(n):
+                    expr = Expr.from_reader(r, budget)
                     init.append(expr)
         return cls(kind, type, tidx, offset, init)
 
@@ -1249,12 +1304,14 @@ class DataDesc:
         return f'{self.midx}'
 
     @classmethod
-    def from_reader(cls, r: io.IOBase) -> typing.Self:
+    def from_reader(
+        cls, r: io.IOBase, budget: 'pywasm.budget.Budget | None' = None
+    ) -> typing.Self:
         kind = pywasm.leb128.u.decode_reader(r)[0]
         match kind:
             case 0x00:
                 midx = 0
-                offset = Expr.from_reader(r)
+                offset = Expr.from_reader(r, budget)
                 init = bytearray(r.read(pywasm.leb128.u.decode_reader(r)[0]))
                 return cls(kind, midx, offset, init)
             case 0x01:
@@ -1264,7 +1321,7 @@ class DataDesc:
                 return cls(kind, midx, offset, init)
             case 0x02:
                 midx = pywasm.leb128.u.decode_reader(r)[0]
-                offset = Expr.from_reader(r)
+                offset = Expr.from_reader(r, budget)
                 init = bytearray(r.read(pywasm.leb128.u.decode_reader(r)[0]))
                 return cls(kind, midx, offset, init)
             case _:
@@ -1311,7 +1368,11 @@ class ModuleDesc:
         self.exps = exps
 
     @classmethod
-    def from_reader(cls, r: io.IOBase):
+    def from_reader(
+        cls, r: io.IOBase, budget: 'pywasm.budget.Budget | None' = None
+    ):
+        if budget is not None and not isinstance(r, pywasm.budget.BudgetedReader):
+            r = pywasm.budget.BudgetedReader(r, budget)
         assert bytearray(r.read(4)) == bytearray([0x00, 0x61, 0x73, 0x6d])
         assert bytearray(r.read(4)) == bytearray([0x01, 0x00, 0x00, 0x00])
 
@@ -1338,41 +1399,55 @@ class ModuleDesc:
 
             match section_id:
                 case 0x00:
-                    desc = Custom.from_reader(section_reader)
+                    desc = Custom.from_reader(section_reader, budget)
                     pywasm.log.debugln('section custom', desc.name)
                 case 0x01:
-                    for _ in range(pywasm.leb128.u.decode_reader(section_reader)[0]):
-                        desc = FuncType.from_reader(section_reader)
+                    count = pywasm.leb128.u.decode_reader(section_reader)[0]
+                    _charge_entry(budget, count)
+                    for _ in range(count):
+                        desc = FuncType.from_reader(section_reader, budget)
                         type.append(desc)
                         pywasm.log.debugln('section type', desc)
                 case 0x02:
-                    for _ in range(pywasm.leb128.u.decode_reader(section_reader)[0]):
-                        desc = Import.from_reader(section_reader)
+                    count = pywasm.leb128.u.decode_reader(section_reader)[0]
+                    _charge_entry(budget, count)
+                    for _ in range(count):
+                        desc = Import.from_reader(section_reader, budget)
                         imps.append(desc)
                         pywasm.log.debugln('section import', desc)
                 case 0x03:
-                    for _ in range(pywasm.leb128.u.decode_reader(section_reader)[0]):
+                    count = pywasm.leb128.u.decode_reader(section_reader)[0]
+                    _charge_entry(budget, count)
+                    for _ in range(count):
                         desc = FuncDesc.from_reader_type(section_reader)
                         func.append(desc)
                         pywasm.log.debugln('section func', desc.type)
                 case 0x04:
-                    for _ in range(pywasm.leb128.u.decode_reader(section_reader)[0]):
+                    count = pywasm.leb128.u.decode_reader(section_reader)[0]
+                    _charge_entry(budget, count)
+                    for _ in range(count):
                         desc = TableType.from_reader(section_reader)
                         tabl.append(desc)
                         pywasm.log.debugln('section table', desc)
                 case 0x05:
-                    for _ in range(pywasm.leb128.u.decode_reader(section_reader)[0]):
+                    count = pywasm.leb128.u.decode_reader(section_reader)[0]
+                    _charge_entry(budget, count)
+                    for _ in range(count):
                         desc = MemType.from_reader(section_reader)
                         mems.append(desc)
                         pywasm.log.debugln('section memory', desc)
                 case 0x06:
-                    for _ in range(pywasm.leb128.u.decode_reader(section_reader)[0]):
-                        desc = GlobalDesc.from_reader(section_reader)
+                    count = pywasm.leb128.u.decode_reader(section_reader)[0]
+                    _charge_entry(budget, count)
+                    for _ in range(count):
+                        desc = GlobalDesc.from_reader(section_reader, budget)
                         glob.append(desc)
                         pywasm.log.debugln('section global', desc)
                 case 0x07:
-                    for _ in range(pywasm.leb128.u.decode_reader(section_reader)[0]):
-                        desc = ExportDesc.from_reader(section_reader)
+                    count = pywasm.leb128.u.decode_reader(section_reader)[0]
+                    _charge_entry(budget, count)
+                    for _ in range(count):
+                        desc = ExportDesc.from_reader(section_reader, budget)
                         exps.append(desc)
                         pywasm.log.debugln('section export', desc)
                 case 0x08:
@@ -1380,21 +1455,29 @@ class ModuleDesc:
                     star = desc
                     pywasm.log.debugln('section start', desc)
                 case 0x09:
-                    for _ in range(pywasm.leb128.u.decode_reader(section_reader)[0]):
-                        desc = ElemDesc.from_reader(section_reader)
+                    count = pywasm.leb128.u.decode_reader(section_reader)[0]
+                    _charge_entry(budget, count)
+                    for _ in range(count):
+                        desc = ElemDesc.from_reader(section_reader, budget)
                         elem.append(desc)
                         pywasm.log.debugln('section elem', desc)
                 case 0x0a:
-                    for i in range(pywasm.leb128.u.decode_reader(section_reader)[0]):
+                    count = pywasm.leb128.u.decode_reader(section_reader)[0]
+                    _charge_entry(budget, count)
+                    for i in range(count):
                         size = pywasm.leb128.u.decode_reader(section_reader)[0]
-                        desc = FuncDesc.from_reader_code(io.BytesIO(section_reader.read(size)))
+                        desc = FuncDesc.from_reader_code(
+                            io.BytesIO(section_reader.read(size)), budget
+                        )
                         func[i].locals = desc.locals
                         func[i].expr = desc.expr
                         pywasm.log.debugln('section code', desc)
                         desc.expr.into_disasm(4)
                 case 0x0b:
-                    for _ in range(pywasm.leb128.u.decode_reader(section_reader)[0]):
-                        desc = DataDesc.from_reader(section_reader)
+                    count = pywasm.leb128.u.decode_reader(section_reader)[0]
+                    _charge_entry(budget, count)
+                    for _ in range(count):
+                        desc = DataDesc.from_reader(section_reader, budget)
                         data.append(desc)
                         pywasm.log.debugln('section data', desc)
                 case 0x0c:
@@ -1567,6 +1650,35 @@ class Machine:
         globin: list[ValInst],
         elemin: list[list[ValInst]]
     ) -> ModuleInst:
+        # Snapshot the store so that a failure partway through admission rolls back every
+        # entry created on behalf of this module instead of leaking half-built structures.
+        snapshot = (
+            len(self.store.func),
+            len(self.store.tabl),
+            len(self.store.mems),
+            len(self.store.glob),
+            len(self.store.elem),
+            len(self.store.data),
+        )
+        try:
+            return self._allocate(module, extern, globin, elemin)
+        except BaseException:
+            n_func, n_tabl, n_mems, n_glob, n_elem, n_data = snapshot
+            del self.store.func[n_func:]
+            del self.store.tabl[n_tabl:]
+            del self.store.mems[n_mems:]
+            del self.store.glob[n_glob:]
+            del self.store.elem[n_elem:]
+            del self.store.data[n_data:]
+            raise
+
+    def _allocate(
+        self,
+        module: ModuleDesc,
+        extern: list[Extern],
+        globin: list[ValInst],
+        elemin: list[list[ValInst]]
+    ) -> ModuleInst:
         inst = ModuleInst()
         inst.type = module.type
         for e in extern:
@@ -1611,7 +1723,26 @@ class Machine:
             inst.exps.append(expi)
         return inst
 
-    def instance(self, module: ModuleDesc, extern: list[Extern]) -> ModuleInst:
+    def instance(
+        self,
+        module: ModuleDesc,
+        extern: list[Extern],
+        budget: 'pywasm.budget.Budget | None' = None
+    ) -> ModuleInst:
+        # Charge everything admission plans to create before any runtime state is touched,
+        # so a rejected module leaves an empty store. Imported externs already live in the
+        # store and are therefore not charged again.
+        if budget is not None:
+            budget.charge_allocation(len(module.func))
+            for e in module.tabl:
+                budget.charge_allocation(1 + e.limits.n)
+            for e in module.mems:
+                budget.charge_allocation(1 + e.limits.n)
+            budget.charge_allocation(len(module.glob))
+            for e in module.elem:
+                budget.charge_allocation(1 + len(e.init))
+            budget.charge_allocation(len(module.data))
+            budget.charge_allocation(len(module.exps))
         assert len(module.imps) == len(extern)
         for a, b in zip(module.imps, extern):
             assert a.kind == b.kind
@@ -4159,7 +4290,11 @@ class Runtime:
         addr = inst.data
         return self.machine.store.glob[addr]
 
-    def instance(self, module: ModuleDesc) -> ModuleInst:
+    def instance(
+        self,
+        module: ModuleDesc,
+        budget: 'pywasm.budget.Budget | None' = None
+    ) -> ModuleInst:
         # A module is instantiated with a list of external values supplying the required imports. Instantiation checks
         # that the module is valid and the provided imports match the declared types, and may fail with an error
         # otherwise. Instantiation can also result in a trap from initializing a table or memory from an active
@@ -4168,16 +4303,20 @@ class Runtime:
         extern: list[Extern] = []
         for e in module.imps:
             extern.append(self.imports[e.module][e.name])
-        return self.machine.instance(module, extern)
+        return self.machine.instance(module, extern, budget)
 
-    def instance_from_file(self, path: str) -> ModuleInst:
+    def instance_from_file(
+        self, path: str, budget: 'pywasm.budget.Budget | None' = None
+    ) -> ModuleInst:
         # Instantiated a module from a local file.
         with open(path, 'rb') as f:
-            return self.instance(ModuleDesc.from_reader(f))
+            return self.instance(ModuleDesc.from_reader(f, budget), budget)
 
-    def instance_from_reader(self, r: io.IOBase) -> ModuleInst:
+    def instance_from_reader(
+        self, r: io.IOBase, budget: 'pywasm.budget.Budget | None' = None
+    ) -> ModuleInst:
         # Instantiates a module from any binary stream.
-        return self.instance(ModuleDesc.from_reader(r))
+        return self.instance(ModuleDesc.from_reader(r, budget), budget)
 
     def invocate(
         self,
