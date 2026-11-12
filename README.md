@@ -59,6 +59,7 @@ $ python test/example.py      # Test example.
 $ python test/main.py         # Test main.
 $ python test/spec.py         # Test spec.
 $ python test/wasi.py         # Test wasi.
+$ python -m unittest test.wasi_security  # Test WASI path authorization.
 ```
 
 # Performance

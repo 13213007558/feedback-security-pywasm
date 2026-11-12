@@ -1,4 +1,6 @@
+import ctypes
 import dataclasses
+import errno as errno_mod
 import fcntl
 import io
 import os
@@ -9,7 +11,42 @@ import select
 import socket
 import stat
 import sys
+import tempfile
 import time
+
+
+def _probe_linkat_nofollow() -> bool:
+    # linkat() with AT_SYMLINK_NOFOLLOW (os.link(..., follow_symlinks=False)) is the only way to hard link a
+    # symbolic link itself instead of its target. The capability is missing on some platforms (notably Windows);
+    # probe it once so path_link can reject the request instead of silently following the link.
+    if not hasattr(os, 'link') or not hasattr(os, 'symlink'):
+        return False
+    with tempfile.TemporaryDirectory() as tmp:
+        src_dir = os.open(tmp, os.O_RDONLY | getattr(os, 'O_DIRECTORY', 0))
+        try:
+            os.symlink('probe-target', os.path.join(tmp, 'probe-link'))
+            try:
+                os.link(
+                    'probe-link',
+                    os.path.join(tmp, 'probe-hard'),
+                    src_dir_fd=src_dir,
+                    dst_dir_fd=src_dir,
+                    follow_symlinks=False,
+                )
+            except (TypeError, NotImplementedError, OSError):
+                return False
+            return os.path.islink(os.path.join(tmp, 'probe-hard'))
+        finally:
+            os.close(src_dir)
+
+
+# Platform capability flags. The path authorization contract distinguishes guarantees the host kernel can provide
+# from operations it cannot; the latter are refused with ERRNO_NOTSUP instead of being emulated unsafely.
+PATH_CAP_LINKAT_NOFOLLOW = _probe_linkat_nofollow()
+# renameat() with directory file descriptors and same-filesystem atomic replacement.
+PATH_CAP_RENAMEAT = hasattr(os, 'rename')
+# Directory-relative *at() syscalls are the foundation of the descriptor-based authorization model.
+PATH_CAP_DIRFD = all([hasattr(os, 'O_NOFOLLOW'), hasattr(os, 'O_DIRECTORY')])
 
 
 class Preview1:
@@ -393,11 +430,18 @@ class Preview1:
     FILE_STATUS_OPENED = 0
     FILE_STATUS_CLOSED = 1
 
+    # macOS fcntl command: return the canonical path of the descriptor in the supplied buffer.
+    MAC_F_GETPATH = 50
+
     @dataclasses.dataclass
     class File:
         host_fd: int
         host_flag: int
         host_name: str
+        # Absolute, symlink-resolved host path of the preopened directory this descriptor derives from. Every
+        # descriptor opened through a preopen inherits the same host_root; path authorization is always verified
+        # against it rather than against path strings alone. Empty for stdio and socket descriptors.
+        host_root: str
         host_status: int
         pipe: io.IOBase | None
         wasm_fd: int
@@ -418,6 +462,7 @@ class Preview1:
             host_fd=sys.stdin.fileno(),
             host_flag=0,
             host_name=sys.stdin.name,
+            host_root='',
             host_status=self.FILE_STATUS_OPENED,
             pipe=None,
             wasm_fd=self.FD_STDIN,
@@ -432,6 +477,7 @@ class Preview1:
             host_fd=sys.stdout.fileno(),
             host_flag=0,
             host_name=sys.stdout.name,
+            host_root='',
             host_status=self.FILE_STATUS_OPENED,
             pipe=None,
             wasm_fd=self.FD_STDOUT,
@@ -446,6 +492,7 @@ class Preview1:
             host_fd=sys.stderr.fileno(),
             host_flag=0,
             host_name=sys.stderr.name,
+            host_root='',
             host_status=self.FILE_STATUS_OPENED,
             pipe=None,
             wasm_fd=self.FD_STDERR,
@@ -463,6 +510,7 @@ class Preview1:
                 host_fd=os.open(v, os.O_RDONLY | os.O_DIRECTORY),
                 host_flag=os.O_RDONLY | os.O_DIRECTORY,
                 host_name=v,
+                host_root=os.path.realpath(v),
                 host_status=self.FILE_STATUS_OPENED,
                 pipe=None,
                 wasm_fd=len(self.fd),
@@ -884,6 +932,7 @@ class Preview1:
         dest.host_fd = stem.host_fd
         dest.host_flag = stem.host_flag
         dest.host_name = stem.host_name
+        dest.host_root = stem.host_root
         dest.host_status = stem.host_status
         dest.pipe = stem.pipe
         dest.wasm_fd = stem.wasm_fd
@@ -973,8 +1022,86 @@ class Preview1:
     def help_badf(self, fd: int) -> bool:
         return fd < 0 or fd >= len(self.fd) or self.fd[fd].wasm_status != self.FILE_STATUS_OPENED
 
-    def help_escp(self, root: str, name: str) -> bool:
-        return not os.path.normpath(os.path.join(root, name)).startswith(root)
+    def help_idir(self, fd: int) -> bool:
+        return self.fd[fd].wasm_type == self.FILETYPE_DIRECTORY
+
+    def help_perm(self, fd: int, perm: int) -> bool:
+        return self.fd[fd].wasm_rights_base & perm == 0
+
+    def help_pipe(self, fd: int) -> bool:
+        return fd < 3 and self.fd[fd].pipe is not None
+
+    def help_sock(self, fd: int) -> bool:
+        return self.fd[fd].wasm_type not in [self.FILETYPE_SOCKET_DGRAM, self.FILETYPE_SOCKET_STREAM]
+
+    def help_check_path_name(self, name: str) -> bool:
+        # A WASI path is a relative, NUL-free sequence of components addressed through a directory descriptor.
+        # Absolute paths and NUL bytes must never reach the host *at() syscalls. An empty path names the
+        # directory descriptor itself, matching POSIX *at() semantics.
+        if '\0' in name:
+            return False
+        if name != '' and os.path.isabs(name):
+            return False
+        return True
+
+    def help_path_join(self, base: str, name: str) -> str:
+        if name == '':
+            return os.path.normpath(base)
+        return os.path.normpath(os.path.join(base, name))
+
+    def help_within(self, root: str, path: str) -> bool:
+        # Boundary-aware containment: commonpath avoids the "/root" vs "/root2" prefix confusion of startswith().
+        try:
+            return os.path.commonpath([os.path.realpath(root), os.path.realpath(path)]) == os.path.realpath(root)
+        except ValueError:
+            return False
+
+    def help_fd_path(self, host_fd: int) -> str | None:
+        # Resolve the kernel object behind an open descriptor to an absolute host path. This closes the symlink and
+        # TOCTOU gap left by path-string checks: a descriptor opened through an in-workdir symlink reports the real
+        # location it points at.
+        if platform.system().lower() == 'darwin':
+            # F_GETPATH returns the canonical path of the open descriptor. The standard-library fcntl wrapper is
+            # used because a raw variadic libc call through ctypes needs explicit argtypes and can crash. The
+            # returned buffer must be kept alive: fcntl mutates and hands back a new object instead of the input.
+            try:
+                reply = fcntl.fcntl(host_fd, self.MAC_F_GETPATH, ctypes.create_string_buffer(1024))
+                if isinstance(reply, bytes):
+                    text = reply.split(b'\0', 1)[0].decode()
+                    if text:
+                        return text
+            except OSError:
+                pass
+        try:
+            link = os.readlink(f'/dev/fd/{host_fd}')
+        except OSError:
+            return None
+        if os.path.isabs(link):
+            return link
+        return os.path.abspath(link)
+
+    def help_confined(self, file: 'Preview1.File', host_fd: int) -> bool:
+        # Descriptor-level authorization. The opened kernel object must live inside the preopened directory this
+        # descriptor inherits from, on the same filesystem device. A replaced or symlinked component that escapes
+        # the workdir fails here even when its path text looked safe.
+        if not file.host_root:
+            return False
+        real = self.help_fd_path(host_fd)
+        if real is None or not self.help_within(file.host_root, real):
+            return False
+        try:
+            if os.fstat(host_fd).st_dev != os.stat(file.host_root).st_dev:
+                return False
+        except OSError:
+            return False
+        return True
+
+    def help_preopen_confined(self, file: 'Preview1.File', name: str) -> bool:
+        # Text-level pre-check before the host syscall: reject NUL bytes, absolute paths and lexical traversal.
+        # Descriptor-level verification in the callers provides the authoritative, symlink-aware guarantee.
+        if not self.help_check_path_name(name):
+            return False
+        return self.help_within(file.host_root, self.help_path_join(file.host_name, name))
 
     def help_wasm_type(self, info: os.stat_result) -> int:
         match info.st_mode:
@@ -992,18 +1119,6 @@ class Preview1:
                 return self.FILETYPE_SYMBOLIC_LINK
             case _:
                 return self.FILETYPE_UNKNOWN
-
-    def help_idir(self, fd: int) -> bool:
-        return self.fd[fd].wasm_type == self.FILETYPE_DIRECTORY
-
-    def help_perm(self, fd: int, perm: int) -> bool:
-        return self.fd[fd].wasm_rights_base & perm == 0
-
-    def help_pipe(self, fd: int) -> bool:
-        return fd < 3 and self.fd[fd].pipe is not None
-
-    def help_sock(self, fd: int) -> bool:
-        return self.fd[fd].wasm_type not in [self.FILETYPE_SOCKET_DGRAM, self.FILETYPE_SOCKET_STREAM]
 
     def help_time(self, id: int) -> int:
         match id:
@@ -1043,6 +1158,30 @@ class Preview1:
                     os.close(e.host_fd)
                     e.host_status = self.FILE_STATUS_CLOSED
 
+    # Rights that only make sense when acting through a directory descriptor.
+    PATH_RIGHTS_ALL = (
+        0
+        | (1 << 9) | (1 << 10) | (1 << 11) | (1 << 12) | (1 << 13) | (1 << 14) | (1 << 15)
+        | (1 << 16) | (1 << 17) | (1 << 18) | (1 << 19) | (1 << 20) | (1 << 24) | (1 << 25)
+        | (1 << 26)
+    )
+
+    def help_errno(self, e: OSError) -> int:
+        # Map host kernel errors, including cross-device failures, to WASI errno values.
+        table = {
+            errno_mod.EEXIST: self.ERRNO_EXIST,
+            errno_mod.ENOENT: self.ERRNO_NOENT,
+            errno_mod.EISDIR: self.ERRNO_ISDIR,
+            errno_mod.ENOTDIR: self.ERRNO_NOTDIR,
+            errno_mod.EACCES: self.ERRNO_PERM,
+            errno_mod.EPERM: self.ERRNO_PERM,
+            errno_mod.EXDEV: self.ERRNO_XDEV,
+            errno_mod.ENAMETOOLONG: self.ERRNO_NAMETOOLONG,
+            errno_mod.ELOOP: self.ERRNO_LOOP,
+            errno_mod.ENOTEMPTY: self.ERRNO_NOTEMPTY,
+        }
+        return table.get(e.errno, self.ERRNO_IO)
+
     def path_create_directory(self, m: pywasm.core.Machine, args: list[int]) -> list[int]:
         # Create a directory.
         if self.help_badf(args[0]):
@@ -1051,13 +1190,17 @@ class Preview1:
             return [self.ERRNO_NOTCAPABLE]
         mems = m.store.mems[m.stack.frame[-1].module.mems[0]]
         file = self.fd[args[0]]
+        if file.wasm_type != self.FILETYPE_DIRECTORY:
+            return [self.ERRNO_NOTDIR]
         name = mems.get(args[1], args[2]).decode()
-        if self.help_escp(file.wasm_name, name):
+        if not self.help_preopen_confined(file, name):
             return [self.ERRNO_PERM]
         try:
             os.mkdir(name, dir_fd=file.host_fd)
         except FileExistsError:
             return [self.ERRNO_EXIST]
+        except OSError as e:
+            return [self.help_errno(e)]
         return [self.ERRNO_SUCCESS]
 
     def path_filestat_get(self, m: pywasm.core.Machine, args: list[int]) -> list[int]:
@@ -1068,15 +1211,39 @@ class Preview1:
             return [self.ERRNO_NOTCAPABLE]
         mems = m.store.mems[m.stack.frame[-1].module.mems[0]]
         file = self.fd[args[0]]
+        if file.wasm_type != self.FILETYPE_DIRECTORY:
+            return [self.ERRNO_NOTDIR]
         flag = args[1]
         name = mems.get(args[2], args[3]).decode()
-        if self.help_escp(file.wasm_name, name):
+        if not self.help_preopen_confined(file, name):
             return [self.ERRNO_PERM]
         foll = flag & self.LOOKUPFLAGS_SYMLINK_FOLLOW != 0
+        host_fd = None
         try:
-            info = os.stat(name, dir_fd=file.host_fd, follow_symlinks=foll)
+            if name == '':
+                # An empty path names the directory descriptor itself; fstat needs no reopen and cannot escape.
+                info = os.fstat(file.host_fd)
+            else:
+                # Open through the directory descriptor with O_NOFOLLOW on the final component, then authorize the
+                # resolved kernel object. An intermediate symlink that leaves the workdir is caught by help_confined.
+                # O_DIRECTORY is only requested when the lookup flags do not follow symlinks on a directory entry;
+                # regular files must open without it or the kernel raises ENOTDIR.
+                open_flag = os.O_RDONLY
+                if not foll:
+                    open_flag |= os.O_NOFOLLOW
+                host_fd = os.open(name, open_flag, dir_fd=file.host_fd)
+                if not self.help_confined(file, host_fd):
+                    return [self.ERRNO_PERM]
+                info = os.fstat(host_fd)
         except FileNotFoundError:
             return [self.ERRNO_NOENT]
+        except OSError as e:
+            if e.errno == errno_mod.ELOOP:
+                return [self.ERRNO_LOOP]
+            return [self.help_errno(e)]
+        finally:
+            if host_fd is not None:
+                os.close(host_fd)
         mems.put_u64(args[4], 1)
         mems.put_u64(args[4] + 8, info.st_ino)
         mems.put_u8(args[4] + 16, self.help_wasm_type(info))
@@ -1099,9 +1266,11 @@ class Preview1:
             return [self.ERRNO_INVAL]
         mems = m.store.mems[m.stack.frame[-1].module.mems[0]]
         file = self.fd[args[0]]
+        if file.wasm_type != self.FILETYPE_DIRECTORY:
+            return [self.ERRNO_NOTDIR]
         flag = args[1]
         name = mems.get(args[2], args[3]).decode()
-        if self.help_escp(file.wasm_name, name):
+        if not self.help_preopen_confined(file, name):
             return [self.ERRNO_PERM]
         info = os.stat(name, dir_fd=file.host_fd)
         atim = info.st_atime_ns
@@ -1119,6 +1288,8 @@ class Preview1:
             os.utime(name, ns=(atim, mtim), dir_fd=file.host_fd, follow_symlinks=foll)
         except FileNotFoundError:
             return [self.ERRNO_NOENT]
+        except OSError as e:
+            return [self.help_errno(e)]
         return [self.ERRNO_SUCCESS]
 
     def path_link(self, m: pywasm.core.Machine, args: list[int]) -> list[int]:
@@ -1132,21 +1303,41 @@ class Preview1:
         mems = m.store.mems[m.stack.frame[-1].module.mems[0]]
         stem = self.fd[args[0]]
         dest = self.fd[args[4]]
+        if stem.wasm_type != self.FILETYPE_DIRECTORY or dest.wasm_type != self.FILETYPE_DIRECTORY:
+            return [self.ERRNO_NOTDIR]
         stem_name = mems.get(args[2], args[3]).decode()
         dest_name = mems.get(args[5], args[6]).decode()
-        if self.help_escp(stem.wasm_name, stem_name):
-            return [self.ERRNO_PERM]
-        if self.help_escp(dest.wasm_name, dest_name):
+        if not self.help_preopen_confined(stem, stem_name) or not self.help_preopen_confined(dest, dest_name):
             return [self.ERRNO_PERM]
         foll = args[1] & self.LOOKUPFLAGS_SYMLINK_FOLLOW != 0
+        if not foll and not PATH_CAP_LINKAT_NOFOLLOW:
+            # The host cannot link the symlink itself; refusing is safer than silently following it.
+            return [self.ERRNO_NOTSUP]
         try:
-            os.link(stem_name, dest_name, src_dir_fd=stem.host_fd, dst_dir_fd=dest.host_fd, follow_symlinks=foll)
+            os.link(
+                stem_name,
+                dest_name,
+                src_dir_fd=stem.host_fd,
+                dst_dir_fd=dest.host_fd,
+                follow_symlinks=foll,
+            )
         except FileExistsError:
             return [self.ERRNO_EXIST]
         except FileNotFoundError:
             return [self.ERRNO_NOENT]
-        except PermissionError:
-            return [self.ERRNO_PERM]
+        except OSError as e:
+            return [self.help_errno(e)]
+        # Post-check on the created directory entry: a hard link must not give a name inside the workdir to an
+        # inode that physically lives outside it. Roll the link back if it does.
+        try:
+            info = os.stat(dest_name, dir_fd=dest.host_fd, follow_symlinks=False)
+            if info.st_dev != os.stat(dest.host_root).st_dev or not self.help_within(
+                dest.host_root, self.help_path_join(dest.host_name, dest_name)
+            ):
+                os.unlink(dest_name, dir_fd=dest.host_fd)
+                return [self.ERRNO_XDEV]
+        except OSError:
+            return [self.ERRNO_SUCCESS]
         return [self.ERRNO_SUCCESS]
 
     def path_open(self, m: pywasm.core.Machine, args: list[int]) -> list[int]:
@@ -1157,12 +1348,20 @@ class Preview1:
             return [self.ERRNO_NOTCAPABLE]
         mems = m.store.mems[m.stack.frame[-1].module.mems[0]]
         file = self.fd[args[0]]
+        if file.wasm_type != self.FILETYPE_DIRECTORY:
+            # A non-directory descriptor holds no path-scoped rights, so opening through it is a capability
+            # failure rather than a kernel ENOTDIR.
+            return [self.ERRNO_NOTCAPABLE]
+        if not PATH_CAP_DIRFD:
+            # Descriptor-relative opening with O_NOFOLLOW is unavailable on this host; the authorization
+            # contract cannot be enforced, so the capability is refused.
+            return [self.ERRNO_NOTSUP]
         name = mems.get(args[2], args[3]).decode()
         wasm_name = os.path.normpath(os.path.join(file.wasm_name, name))
         host_name = os.path.normpath(os.path.join(file.host_name, name))
-        if '\0' in name:
+        if not self.help_check_path_name(name):
             return [self.ERRNO_ILSEQ]
-        if self.help_escp(file.host_name, name):
+        if not self.help_preopen_confined(file, name):
             return [self.ERRNO_PERM]
         flag = 0
         if args[1] & self.LOOKUPFLAGS_SYMLINK_FOLLOW == 0:
@@ -1186,8 +1385,16 @@ class Preview1:
         if args[7] & self.FDFLAGS_APPEND:
             flag |= os.O_APPEND
         wasm_fd = len(self.fd)
+        host_fd = None
         try:
-            host_fd = os.open(name, flag, 0o644, dir_fd=self.fd[args[0]].host_fd)
+            if name == '':
+                # An empty path names the directory descriptor itself. macOS (and strict POSIX) reject open(""),
+                # so duplicate the existing directory descriptor instead; the kernel object is identical.
+                if args[4] & self.OFLAGS_DIRECTORY == 0:
+                    return [self.ERRNO_ISDIR]
+                host_fd = os.dup(file.host_fd)
+            else:
+                host_fd = os.open(name, flag, 0o644, dir_fd=file.host_fd)
         except FileExistsError:
             return [self.ERRNO_EXIST]
         except FileNotFoundError:
@@ -1197,42 +1404,36 @@ class Preview1:
         except NotADirectoryError:
             return [self.ERRNO_NOTDIR]
         except OSError as e:
-            if platform.system().lower() == 'darwin' and e.errno == 62:
+            if e.errno == errno_mod.ELOOP:
                 return [self.ERRNO_LOOP]
-            if platform.system().lower() == 'linux' and e.errno == 40:
-                return [self.ERRNO_LOOP]
-            raise e
-        rights_base = args[5]
-        rights_root = args[6]
+            return [self.help_errno(e)]
+        # Authorize the actual kernel object the descriptor points at, not just the requested path text. Any
+        # rejection closes the fresh descriptor first so a failed open never leaks a host fd into the table.
+        if not self.help_confined(file, host_fd):
+            os.close(host_fd)
+            return [self.ERRNO_PERM]
+        # Inherited rights: a child can never hold more rights than the directory it was opened through grants.
+        rights_base = args[5] & file.wasm_rights_root
+        rights_root = args[6] & file.wasm_rights_root
         # Drectory does not have the seek right.
         if os.path.isdir(host_fd):
             void = self.RIGHTS_FD_SEEK
             rights_base &= ~void
             rights_root &= ~void
+            # A directory descriptor is a traversal handle. It must keep the path-scoped rights of the preopen it
+            # derives from so further path_open/path_* calls beneath it stay authorized, even when the guest did
+            # not spell those rights out again (masking them to 0 would make every subdirectory a dead end).
+            rights_base |= file.wasm_rights_root & self.PATH_RIGHTS_ALL
+            rights_root = file.wasm_rights_root & ~void
         # Files shouldn't have rights for path_* syscalls even if manually given.
         if os.path.isfile(host_fd):
-            void = sum([
-                self.RIGHTS_PATH_CREATE_DIRECTORY,
-                self.RIGHTS_PATH_CREATE_FILE,
-                self.RIGHTS_PATH_LINK_SOURCE,
-                self.RIGHTS_PATH_LINK_TARGET,
-                self.RIGHTS_PATH_OPEN,
-                self.RIGHTS_PATH_READLINK,
-                self.RIGHTS_PATH_RENAME_SOURCE,
-                self.RIGHTS_PATH_RENAME_TARGET,
-                self.RIGHTS_PATH_FILESTAT_GET,
-                self.RIGHTS_PATH_FILESTAT_SET_SIZE,
-                self.RIGHTS_PATH_FILESTAT_SET_TIMES,
-                self.RIGHTS_PATH_SYMLINK,
-                self.RIGHTS_PATH_REMOVE_DIRECTORY,
-                self.RIGHTS_PATH_UNLINK_FILE,
-            ])
-            rights_base &= ~void
-            rights_root &= ~void
+            rights_base &= ~self.PATH_RIGHTS_ALL
+            rights_root &= ~self.PATH_RIGHTS_ALL
         self.fd.append(Preview1.File(
             host_fd=host_fd,
             host_flag=flag,
             host_name=host_name,
+            host_root=file.host_root,
             host_status=self.FILE_STATUS_OPENED,
             pipe=None,
             wasm_fd=wasm_fd,
@@ -1254,13 +1455,17 @@ class Preview1:
             return [self.ERRNO_NOTCAPABLE]
         mems = m.store.mems[m.stack.frame[-1].module.mems[0]]
         file = self.fd[args[0]]
+        if file.wasm_type != self.FILETYPE_DIRECTORY:
+            return [self.ERRNO_NOTDIR]
         name = mems.get(args[1], args[2]).decode()
-        if self.help_escp(file.wasm_name, name):
+        if not self.help_preopen_confined(file, name):
             return [self.ERRNO_PERM]
         try:
             data = os.readlink(name, dir_fd=file.host_fd)
         except FileNotFoundError:
             return [self.ERRNO_NOENT]
+        except OSError as e:
+            return [self.help_errno(e)]
         size = min(len(data), args[4])
         mems.put(args[3], bytearray(data[:size].encode()))
         mems.put_u32(args[5], size)
@@ -1274,19 +1479,17 @@ class Preview1:
             return [self.ERRNO_NOTCAPABLE]
         mems = m.store.mems[m.stack.frame[-1].module.mems[0]]
         file = self.fd[args[0]]
+        if file.wasm_type != self.FILETYPE_DIRECTORY:
+            return [self.ERRNO_NOTDIR]
         name = mems.get(args[1], args[2]).decode()
-        if self.help_escp(file.wasm_name, name):
+        if not self.help_preopen_confined(file, name):
             return [self.ERRNO_PERM]
         try:
             os.rmdir(name, dir_fd=file.host_fd)
         except NotADirectoryError:
             return [self.ERRNO_NOTDIR]
         except OSError as e:
-            if platform.system().lower() == 'darwin' and e.errno == 66:
-                return [self.ERRNO_NOTEMPTY]
-            if platform.system().lower() == 'linux' and e.errno == 39:
-                return [self.ERRNO_NOTEMPTY]
-            raise e
+            return [self.help_errno(e)]
         return [self.ERRNO_SUCCESS]
 
     def path_rename(self, m: pywasm.core.Machine, args: list[int]) -> list[int]:
@@ -1300,28 +1503,27 @@ class Preview1:
         mems = m.store.mems[m.stack.frame[-1].module.mems[0]]
         stem = self.fd[args[0]]
         dest = self.fd[args[3]]
+        if stem.wasm_type != self.FILETYPE_DIRECTORY or dest.wasm_type != self.FILETYPE_DIRECTORY:
+            return [self.ERRNO_NOTDIR]
+        if not PATH_CAP_RENAMEAT:
+            # Without renameat() the host cannot give the atomic, directory-relative replacement the contract
+            # relies on; a copy/unlink emulation would not be atomic and is therefore refused.
+            return [self.ERRNO_NOTSUP]
         stem_name = mems.get(args[1], args[2]).decode()
         dest_name = mems.get(args[4], args[5]).decode()
-        if self.help_escp(stem.wasm_name, stem_name):
-            return [self.ERRNO_PERM]
-        if self.help_escp(dest.wasm_name, dest_name):
+        if not self.help_preopen_confined(stem, stem_name) or not self.help_preopen_confined(dest, dest_name):
             return [self.ERRNO_PERM]
         try:
+            # renameat() replacement is atomic within a single filesystem (POSIX). Refuse cross-device moves
+            # up front: the kernel cannot make them atomic and would only raise EXDEV anyway.
+            src_info = os.stat(stem_name, dir_fd=stem.host_fd, follow_symlinks=False)
+            if src_info.st_dev != os.stat(dest.host_root).st_dev:
+                return [self.ERRNO_XDEV]
             os.rename(stem_name, dest_name, src_dir_fd=stem.host_fd, dst_dir_fd=dest.host_fd)
-        except FileExistsError:
-            return [self.ERRNO_EXIST]
         except FileNotFoundError:
             return [self.ERRNO_NOENT]
-        except IsADirectoryError:
-            return [self.ERRNO_ISDIR]
-        except NotADirectoryError:
-            return [self.ERRNO_NOTDIR]
         except OSError as e:
-            if platform.system().lower() == 'darwin' and e.errno == 66:
-                return [self.ERRNO_NOTEMPTY]
-            if platform.system().lower() == 'linux' and e.errno == 39:
-                return [self.ERRNO_NOTEMPTY]
-            raise e
+            return [self.help_errno(e)]
         return [self.ERRNO_SUCCESS]
 
     def path_symlink(self, m: pywasm.core.Machine, args: list[int]) -> list[int]:
@@ -1332,11 +1534,15 @@ class Preview1:
             return [self.ERRNO_NOTCAPABLE]
         mems = m.store.mems[m.stack.frame[-1].module.mems[0]]
         file = self.fd[args[2]]
+        if file.wasm_type != self.FILETYPE_DIRECTORY:
+            return [self.ERRNO_NOTDIR]
         stem = mems.get(args[0], args[1]).decode()
         dest = mems.get(args[3], args[4]).decode()
-        if self.help_escp(file.wasm_name, stem):
+        if '\0' in stem or not self.help_check_path_name(dest) or dest == '':
             return [self.ERRNO_PERM]
-        if self.help_escp(file.wasm_name, dest):
+        # The link's own directory entry must be inside the workdir. The link target text is opaque to WASI;
+        # containment of its resolution is enforced by path_open's descriptor check instead.
+        if not self.help_preopen_confined(file, dest):
             return [self.ERRNO_PERM]
         try:
             os.symlink(stem, dest, dir_fd=file.host_fd)
@@ -1346,6 +1552,8 @@ class Preview1:
             return [self.ERRNO_NOENT]
         except NotADirectoryError:
             return [self.ERRNO_NOTDIR]
+        except OSError as e:
+            return [self.help_errno(e)]
         return [self.ERRNO_SUCCESS]
 
     def path_unlink_file(self, m: pywasm.core.Machine, args: list[int]) -> list[int]:
@@ -1356,8 +1564,10 @@ class Preview1:
             return [self.ERRNO_NOTCAPABLE]
         mems = m.store.mems[m.stack.frame[-1].module.mems[0]]
         file = self.fd[args[0]]
+        if file.wasm_type != self.FILETYPE_DIRECTORY:
+            return [self.ERRNO_NOTDIR]
         name = mems.get(args[1], args[2]).decode()
-        if self.help_escp(file.wasm_name, name):
+        if not self.help_preopen_confined(file, name):
             return [self.ERRNO_PERM]
         try:
             os.unlink(name, dir_fd=file.host_fd)
@@ -1367,6 +1577,8 @@ class Preview1:
             return [self.ERRNO_NOTDIR]
         except PermissionError:
             return [self.ERRNO_PERM]
+        except OSError as e:
+            return [self.help_errno(e)]
         return [self.ERRNO_SUCCESS]
 
     def poll_oneoff(self, m: pywasm.core.Machine, args: list[int]) -> list[int]:
@@ -1493,6 +1705,7 @@ class Preview1:
             host_fd=host_fd,
             host_flag=0,
             host_name=file.host_name,
+            host_root='',
             host_status=self.FILE_STATUS_OPENED,
             pipe=None,
             wasm_fd=wasm_fd,
