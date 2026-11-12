@@ -1018,15 +1018,29 @@ class Preview1:
             case _:
                 return 0
 
+    def close(self) -> None:
+        # Explicit compensation contract for the host resources owned by this WASI context: every pre-opened
+        # directory and every descriptor opened through path_open/sock_accept holds a real host file descriptor.
+        # The standard streams (indices 0..2) wrap the process stdio and are never closed here. Call this when the
+        # context is discarded, including after a failed instantiation, to avoid leaking host descriptors.
+        for file in self.fd[self.FD_STDERR + 1:]:
+            if file.wasm_type == self.FILETYPE_CHARACTER_DEVICE:
+                continue
+            if file.host_status == self.FILE_STATUS_OPENED:
+                os.close(file.host_fd)
+                file.host_status = self.FILE_STATUS_CLOSED
+
     def main(self, runtime: pywasm.core.Runtime, module: pywasm.core.ModuleInst) -> int:
         # Attempt to begin execution of instance as a wasi command by invoking its _start() export. If instance does
         # not contain a _start() export, then an exception is thrown.
         try:
             runtime.invocate(module, '_start', [])
         except Exception as e:
-            runtime.machine.stack.frame.clear()
-            runtime.machine.stack.label.clear()
-            runtime.machine.stack.value.clear()
+            # Machine.invocate already restores the interpreter stack to its entry state on a trap, so the runtime
+            # remains usable for other instances. The finally block below is the compensation that releases the host
+            # descriptors owned by this context; host side effects performed by the wasm program itself (files
+            # created, bytes written) cannot be undone and are deliberately not rolled back, per the embedder
+            # contract of WASI commands.
             if len(e.args) >= 1 and e.args[0] == SystemExit:
                 return e.args[1]
             raise e

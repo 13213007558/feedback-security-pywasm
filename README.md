@@ -57,9 +57,38 @@ $ python script/build_wasi.py # Download wasi tests at res/wasi-testsuite.
 
 $ python test/example.py      # Test example.
 $ python test/main.py         # Test main.
+$ python test/rollback.py     # Test transactional instantiation and failure rollback.
 $ python test/spec.py         # Test spec.
 $ python test/wasi.py         # Test wasi.
 ```
+
+# Instantiation and failure rollback
+
+A single `Runtime` can instantiate many modules one after another into one shared
+`Store`. Every `Runtime.instance()` call is an all-or-nothing transaction with three
+commit boundaries:
+
+1. Import matching. Missing or mismatched imports raise `pywasm.LinkError` before any
+   store entity is allocated, so the store and the machine stack are untouched.
+2. Allocation and segment initialization. A store snapshot is taken first; if a global,
+   table or data initializer traps, every entity allocated by the attempt is reclaimed and
+   the stack is reset.
+3. The start function. A trap (including a `pywasm.Trap` raised by a host function) still
+   rolls back the whole instantiation because the instance is never published.
+
+Only entities owned by the failing attempt are deleted. Entities of already running
+instances are restored in place, including the import objects they share, so their store
+addresses and object identities stay valid. Trap conditions raised by wasm instructions or
+assertions are surfaced as `pywasm.Trap`; a trapped `invocate()` likewise resets the stack
+to its entry state without changing the store.
+
+Host side effects that escape the abstract machine cannot be undone by the store
+rollback. The WASI `Preview1` context therefore documents an explicit compensation
+contract: `Preview1.close()` releases the host file descriptors it owns (pre-opened
+directories and descriptors opened through `path_open`/`sock_accept`); the process
+standard streams are never closed. Files created or bytes written by a wasm program are
+the program's observable effects and are deliberately retained, as is standard for WASI
+commands.
 
 # Performance
 

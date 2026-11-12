@@ -9,6 +9,20 @@ import struct
 import typing
 
 
+class Trap(Exception):
+    # A trap is the mechanism for aborting the execution of WebAssembly code immediately. Traps may be triggered by
+    # WebAssembly instructions, e.g. when executing an unreachable instruction or performing an invalid memory access,
+    # or they may be raised by the embedder through a host function. A trap immediately aborts the enclosing
+    # instantiation or invocation.
+    pass
+
+
+class LinkError(Trap):
+    # Raised when the external values supplied to an instantiation do not match the imports declared by the module.
+    # It is thrown before any new store entity is allocated, so the store is left untouched.
+    pass
+
+
 class ValType:
     # Value types are encoded by a single byte.
 
@@ -1502,6 +1516,32 @@ class Store:
         self.data.append(inst)
         return addr
 
+    def snapshot(self) -> tuple[int, int, int, int, int, int]:
+        # Record the number of entities of each kind currently held by the store. The returned boundary lets
+        # Machine.instance() roll back every entity allocated by a failed instantiation while keeping every entity
+        # that pre-dated it. Addresses are dense indices, so the entities of one instantiation always form one
+        # contiguous tail in each vector.
+        return (
+            len(self.func),
+            len(self.tabl),
+            len(self.mems),
+            len(self.glob),
+            len(self.elem),
+            len(self.data),
+        )
+
+    def rollback(self, mark: tuple[int, int, int, int, int, int]) -> None:
+        # Drop every store entity allocated after the snapshot was taken. Entities at indices below the boundary are
+        # restored in place rather than replaced with fresh containers, because running module instances keep direct
+        # references to the same Store vectors through their imported addresses.
+        nfunc, ntabl, nmems, nglob, nelem, ndata = mark
+        del self.func[nfunc:]
+        del self.tabl[ntabl:]
+        del self.mems[nmems:]
+        del self.glob[nglob:]
+        del self.elem[nelem:]
+        del self.data[ndata:]
+
 
 class Label:
     # Labels carry an argument arity n and their associated branch target, which is expressed syntactically as an
@@ -1612,20 +1652,68 @@ class Machine:
         return inst
 
     def instance(self, module: ModuleDesc, extern: list[Extern]) -> ModuleInst:
-        assert len(module.imps) == len(extern)
+        # Instantiation is split into three commit boundaries:
+        #
+        # 1. Import matching. Nothing is allocated yet. A mismatch raises LinkError and leaves both the store and the
+        #    stack untouched, so already running instances (and the import objects they share) cannot be affected.
+        #
+        # 2. Allocation and segment initialization. A store snapshot is taken first; every entity allocated from here
+        #    on forms a contiguous tail of the store vectors. If a global/element/data initializer or an active
+        #    segment traps, the tail is discarded via Store.rollback() and the stack is restored to its entry state.
+        #
+        # 3. The start function. By this boundary all module entities are fully initialized; an active segment has
+        #    already been dropped, matching the WebAssembly semantics. A trap still rolls back the whole instantiation
+        #    because the instance is never published to the embedder.
+        #
+        # Only entities owned by this instantiation are ever deleted. Imported entities live at addresses below the
+        # snapshot boundary and are restored in place, so other instances that imported the same objects keep working.
+        self.check_imports(module, extern)
+        mark = self.store.snapshot()
+        entry_frame = len(self.stack.frame)
+        entry_label = len(self.stack.label)
+        entry_value = len(self.stack.value)
+        try:
+            return self.instantiate(module, extern)
+        except Exception as e:
+            # Assertions implement the interpreter's trap conditions (out-of-bounds access, unreachable, ...), and a
+            # host function may raise Trap directly. Every failure between the snapshot and the successful return
+            # aborts the whole instantiation, so compensation always runs before the exception is re-raised.
+            self.stack.frame = self.stack.frame[:entry_frame]
+            self.stack.label = self.stack.label[:entry_label]
+            self.stack.value = self.stack.value[:entry_value]
+            self.store.rollback(mark)
+            if isinstance(e, Trap):
+                raise
+            raise Trap(str(e) or e.__class__.__name__) from e
+
+    def check_imports(self, module: ModuleDesc, extern: list[Extern]) -> None:
+        # Phase 1: verify that one external value is supplied for every import and that its kind and type match the
+        # import declaration. This is a pure read of the existing store; it never mutates any state.
+        if len(module.imps) != len(extern):
+            raise LinkError(f'instantiation requires {len(module.imps)} imports, {len(extern)} supplied')
         for a, b in zip(module.imps, extern):
-            assert a.kind == b.kind
+            if a.kind != b.kind:
+                raise LinkError(f'import {a.module}.{a.name}: kind mismatch')
             match a.kind:
                 case 0x00:
-                    assert self.store.func[b.data].type == module.type[a.desc]
+                    # For function imports the descriptor is the index of the required function type.
+                    if self.store.func[b.data].type != module.type[a.desc]:
+                        raise LinkError(f'import {a.module}.{a.name}: function type mismatch')
                 case 0x01:
-                    assert self.store.tabl[b.data].type.type == a.desc.type
-                    assert self.store.tabl[b.data].suit(a.desc.limits)
+                    if self.store.tabl[b.data].type.type != a.desc.type:
+                        raise LinkError(f'import {a.module}.{a.name}: table element type mismatch')
+                    if not self.store.tabl[b.data].suit(a.desc.limits):
+                        raise LinkError(f'import {a.module}.{a.name}: table size mismatch')
                 case 0x02:
-                    assert self.store.mems[b.data].suit(a.desc.limits)
+                    if not self.store.mems[b.data].suit(a.desc.limits):
+                        raise LinkError(f'import {a.module}.{a.name}: memory size mismatch')
                 case 0x03:
-                    assert self.store.glob[b.data].data.type == a.desc.type
-                    assert self.store.glob[b.data].mut == a.desc.mut
+                    if self.store.glob[b.data].data.type != a.desc.type:
+                        raise LinkError(f'import {a.module}.{a.name}: global type mismatch')
+                    if self.store.glob[b.data].mut != a.desc.mut:
+                        raise LinkError(f'import {a.module}.{a.name}: global mutability mismatch')
+
+    def instantiate(self, module: ModuleDesc, extern: list[Extern]) -> ModuleInst:
         globin: list[ValInst] = []
         elemin: list[list[ValInst]] = []
         auxmod = ModuleInst()
@@ -1714,6 +1802,9 @@ class Machine:
         assert isinstance(func, FuncInst)
         for a, b in zip(func.type.args, args):
             assert a == b.type
+        entry_frame = len(self.stack.frame)
+        entry_label = len(self.stack.label)
+        entry_value = len(self.stack.value)
         self.stack.frame.append(Frame(ModuleInst(), LocalsInst([]), 0, 0, 0))
         pywasm.log.debugln('invocate', addr, args)
         locals = LocalsInst(args)
@@ -1721,15 +1812,25 @@ class Machine:
             locals.data.extend([ValInst.zero(e.type) for _ in range(e.n)])
         self.stack.frame.append(Frame(func.module, locals, len(func.type.rets), 0, 0))
         self.stack.label.append(Label(len(func.type.rets), 1, 0, 3, func.code.expr.data, 0))
-        self.evaluate()
-        rets = [self.stack.value.pop() for _ in range(len(func.type.rets))][::-1]
-        for a, b in zip(func.type.rets, rets):
-            assert a == b.type
-        self.stack.frame.pop()
-        assert len(self.stack.frame) == 0
-        assert len(self.stack.label) == 0
-        assert len(self.stack.value) == 0
-        return rets
+        try:
+            self.evaluate()
+            rets = [self.stack.value.pop() for _ in range(len(func.type.rets))][::-1]
+            for a, b in zip(func.type.rets, rets):
+                assert a == b.type
+            self.stack.frame.pop()
+            assert len(self.stack.frame) == entry_frame
+            assert len(self.stack.label) == entry_label
+            assert len(self.stack.value) == entry_value
+            return rets
+        except Exception as e:
+            # A trap inside an invocation must not leave partial frames behind. Restore the stack to the state the
+            # caller observed on entry; the store itself is untouched here because an invocation never allocates.
+            self.stack.frame = self.stack.frame[:entry_frame]
+            self.stack.label = self.stack.label[:entry_label]
+            self.stack.value = self.stack.value[:entry_value]
+            if isinstance(e, Trap):
+                raise
+            raise Trap(str(e) or e.__class__.__name__) from e
 
     def evaluate_br(self, l: int) -> None:
         assert len(self.stack.label) >= l + 1
@@ -4161,12 +4262,16 @@ class Runtime:
 
     def instance(self, module: ModuleDesc) -> ModuleInst:
         # A module is instantiated with a list of external values supplying the required imports. Instantiation checks
-        # that the module is valid and the provided imports match the declared types, and may fail with an error
-        # otherwise. Instantiation can also result in a trap from initializing a table or memory from an active
-        # segment or from executing the start function. It is up to the embedder to define how such conditions are
-        # reported.
+        # that the module is valid and the provided imports match the declared types, and may fail with a LinkError
+        # otherwise. Instantiation can also result in a Trap from initializing a table or memory from an active
+        # segment or from executing the start function. On either failure the store entities allocated by this call
+        # are reclaimed and the machine stack is reset, while entities belonging to already running instances,
+        # including the shared import objects, are preserved byte-for-byte. It is up to the embedder to define how
+        # such conditions are reported.
         extern: list[Extern] = []
         for e in module.imps:
+            if e.module not in self.imports or e.name not in self.imports[e.module]:
+                raise LinkError(f'unknown import: {e.module}.{e.name}')
             extern.append(self.imports[e.module][e.name])
         return self.machine.instance(module, extern)
 
