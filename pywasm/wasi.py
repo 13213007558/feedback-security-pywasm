@@ -1,3 +1,4 @@
+import contextvars
 import dataclasses
 import fcntl
 import io
@@ -10,6 +11,83 @@ import socket
 import stat
 import sys
 import time
+import typing
+
+
+class TaskError(RuntimeError):
+    # Raised when a task is entered or exited incorrectly, or when code tries to use a task after it has been
+    # revoked. Task revocation is deliberately fail-closed: a revoked task never falls back to another task's state.
+    pass
+
+
+class TaskNotActiveError(TaskError):
+    # Raised when a wasi host function is called without an active task, or when no task can be entered.
+    pass
+
+
+class TaskRevokedError(TaskError):
+    # Raised when a wasi host function is called after its task has been revoked.
+    pass
+
+
+class TaskConflictError(TaskError):
+    # Raised when enter/exit operations are not properly nested.
+    pass
+
+
+class SharedDir:
+    # An explicitly shared, read-only preopened directory.
+    #
+    # Ownership: the caller owns this object and its host file descriptor. The wasi host never closes it. Each task
+    # that enters with this resource borrows a read-only capability for the lifetime of that task. Closing the
+    # SharedDir is the caller's responsibility and must happen only after all tasks using it have exited.
+    #
+    # The host enforces read-only access by granting only read/list/stat rights and by rejecting path_open requests
+    # that ask for write or mutation rights.
+
+    def __init__(self, wasm_name: str, host_path: str, owner: str):
+        if not owner:
+            raise ValueError('shared directory ownership must be declared')
+        self.wasm_name = os.path.normpath(wasm_name)
+        self.host_path = os.path.abspath(os.path.normpath(host_path))
+        self.owner = owner
+        self.read_only = True
+        self._fd = os.open(self.host_path, os.O_RDONLY | os.O_DIRECTORY)
+        self._closed = False
+        self._leases = 0
+
+    @property
+    def fd(self) -> int:
+        if self._closed:
+            raise TaskRevokedError(f'parent directory shared by {self.owner!r} is closed')
+        return self._fd
+
+    def borrow(self) -> int:
+        # Register a task lease. The owner cannot close the descriptor while a lease is outstanding.
+        if self._closed:
+            raise TaskRevokedError(f'parent directory shared by {self.owner!r} is closed')
+        self._leases += 1
+        return self._fd
+
+    def release(self) -> None:
+        self._leases = max(0, self._leases - 1)
+
+    def close(self) -> None:
+        # Close the backing descriptor. Refuses while any task still borrows it.
+        if self._closed:
+            return
+        if self._leases:
+            raise TaskConflictError(
+                f'cannot close {self.wasm_name!r}: {self._leases} task lease(s) still owned by {self.owner!r}'
+            )
+        os.close(self._fd)
+        self._closed = True
+
+    def __enter__(self) -> typing.Self:
+        return self
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.close()
 
 
 class Preview1:
@@ -407,11 +485,51 @@ class Preview1:
         wasm_rights_root: int
         wasm_status: int
         wasm_type: int
+        # Ownership marker. "task" means the task owns the host descriptor and must close it on revocation;
+        # "host" means the embedding process owns it and it must outlive every task. Shared preopened directories
+        # are borrowed from a SharedDir whose owner is recorded here and are never closed by a task.
+        host_owner: str = 'task'
+        host_shared: bool = False
+        wasm_read_only: bool = False
 
-    def __init__(self, args: list[str], dirs: dict[str, str], envs: dict[str, str]):
-        self.args = args
+    # Rights granted to an explicitly shared, read-only preopened directory. It can be listed, opened read-only,
+    # and inspected, but it cannot create, rename, remove, link, or write anything.
+    SHARED_RIGHTS_BASE = RIGHTS_PATH_OPEN | RIGHTS_FD_READDIR | RIGHTS_PATH_READLINK | RIGHTS_PATH_FILESTAT_GET
+    SHARED_RIGHTS_ROOT = sum([
+        SHARED_RIGHTS_BASE,
+        RIGHTS_FD_READ,
+        RIGHTS_FD_SEEK,
+        RIGHTS_FD_TELL,
+        RIGHTS_FD_FILESTAT_GET,
+        RIGHTS_FD_ADVISE,
+        RIGHTS_POLL_FD_READWRITE,
+    ])
+
+    def __init__(
+        self,
+        args: list[str],
+        dirs: dict[str, str],
+        envs: dict[str, str],
+        shared_dirs: dict[str, SharedDir] | list[SharedDir] | None = None,
+        *,
+        host: 'Host | None' = None,
+    ):
+        # Snapshot every task-scoped input so a caller mutating a dictionary or list after entering a task cannot
+        # alter that task (or be observed by the next task).
+        self.args = list(args)
         self.dirs = {os.path.normpath(k): os.path.normpath(v) for k, v in dirs.items()}
         self.envs = ['='.join(e) for e in sorted(envs.items())]
+        self.shared_dirs = self._normalize_shared(shared_dirs)
+        overlap = set(self.dirs) & set(self.shared_dirs)
+        if overlap:
+            raise ValueError(f'directory mounted both read-write and read-only: {sorted(overlap)}')
+        self._preopen_fds: set[int] = set()
+        self._shared_leases: list[SharedDir] = []
+        self._revoked = False
+        self._modules: list[pywasm.core.ModuleInst] = []
+        self.exit_code: int | None = None
+        self._host: Host | None = None
+        self._runtime: pywasm.core.Runtime | None = None
         # By setting the pipe to io.BytesIO(bytearray()) to capture output or provide input.
         self.fd: list[Preview1.File] = []
         self.fd.append(self.File(
@@ -427,6 +545,7 @@ class Preview1:
             wasm_rights_root=0,
             wasm_status=self.FILE_STATUS_OPENED,
             wasm_type=self.FILETYPE_CHARACTER_DEVICE,
+            host_owner='host',
         ))
         self.fd.append(self.File(
             host_fd=sys.stdout.fileno(),
@@ -441,6 +560,7 @@ class Preview1:
             wasm_rights_root=0,
             wasm_status=self.FILE_STATUS_OPENED,
             wasm_type=self.FILETYPE_CHARACTER_DEVICE,
+            host_owner='host',
         ))
         self.fd.append(self.File(
             host_fd=sys.stderr.fileno(),
@@ -455,10 +575,27 @@ class Preview1:
             wasm_rights_root=0,
             wasm_status=self.FILE_STATUS_OPENED,
             wasm_type=self.FILETYPE_CHARACTER_DEVICE,
+            host_owner='host',
         ))
+        try:
+            self._open_dirs()
+        except BaseException:
+            self._close_owned()
+            raise
+        # By default, when wasi applications call proc_exit(), wasi.main() will return with the exit code specified
+        # rather than terminating the process. Setting this option to 0 will cause the python process to exit with the
+        # specified exit code instead.
+        self.return_on_exit = 1
+        self._host = host
+        self._runtime = host.runtime if host is not None else None
+        if host is not None:
+            host._ensure_bound()
+
+    def _open_dirs(self) -> None:
         for k, v in sorted(self.dirs.items()):
             k = os.path.normpath(k)
             v = os.path.abspath(os.path.normpath(v))
+            self._preopen_fds.add(len(self.fd))
             self.fd.append(self.File(
                 host_fd=os.open(v, os.O_RDONLY | os.O_DIRECTORY),
                 host_flag=os.O_RDONLY | os.O_DIRECTORY,
@@ -472,16 +609,136 @@ class Preview1:
                 wasm_rights_root=0b00001111111111111111111111111111,
                 wasm_status=self.FILE_STATUS_OPENED,
                 wasm_type=self.FILETYPE_DIRECTORY,
+                host_owner='task',
             ))
-        # By default, when wasi applications call proc_exit(), wasi.main() will return with the exit code specified
-        # rather than terminating the process. Setting this option to 0 will cause the python process to exit with the
-        # specified exit code instead.
-        self.return_on_exit = 1
+        for k, v in sorted(self.shared_dirs.items()):
+            self._preopen_fds.add(len(self.fd))
+            self._shared_leases.append(v)
+            self.fd.append(self.File(
+                # Borrowed from SharedDir; the owner closes it, not this task.
+                host_fd=v.borrow(),
+                host_flag=os.O_RDONLY | os.O_DIRECTORY,
+                host_name=v.host_path,
+                host_status=self.FILE_STATUS_OPENED,
+                pipe=None,
+                wasm_fd=len(self.fd),
+                wasm_flag=0,
+                wasm_name=k,
+                wasm_rights_base=self.SHARED_RIGHTS_BASE,
+                wasm_rights_root=self.SHARED_RIGHTS_ROOT,
+                wasm_status=self.FILE_STATUS_OPENED,
+                wasm_type=self.FILETYPE_DIRECTORY,
+                host_owner=v.owner,
+                host_shared=True,
+                wasm_read_only=True,
+            ))
+
+    def _close_owned(self) -> None:
+        closed: set[int] = set()
+        for e in self.fd:
+            if e.host_owner == 'task' and not e.host_shared and e.host_status == self.FILE_STATUS_OPENED:
+                if e.host_fd not in closed:
+                    try:
+                        os.close(e.host_fd)
+                        closed.add(e.host_fd)
+                    except OSError:
+                        pass
+                e.host_status = self.FILE_STATUS_CLOSED
+                e.wasm_status = self.FILE_STATUS_CLOSED
+        for lease in self._shared_leases:
+            lease.release()
+        self._shared_leases.clear()
+
+    @staticmethod
+    def _normalize_shared(
+        shared_dirs: dict[str, SharedDir] | list[SharedDir] | None,
+    ) -> dict[str, SharedDir]:
+        if not shared_dirs:
+            return {}
+        if isinstance(shared_dirs, dict):
+            entries = shared_dirs
+        else:
+            entries = {e.wasm_name: e for e in shared_dirs}
+        result = {}
+        for k, v in entries.items():
+            if not isinstance(v, SharedDir):
+                raise TypeError('shared_dirs values must be SharedDir instances so ownership is explicit')
+            name = os.path.normpath(k)
+            if name != v.wasm_name:
+                raise ValueError(f'shared dir mounted as {name!r} but declared as {v.wasm_name!r}')
+            result[name] = v
+        return result
+
+    @property
+    def revoked(self) -> bool:
+        return self._revoked
+
+    def _require_live(self) -> None:
+        if self._revoked:
+            raise TaskRevokedError('wasi task capability has been revoked')
+
+    def revoke(self) -> None:
+        # Withdraw the task's capability. Idempotent. Every host descriptor owned by this task is closed, including
+        # descriptors opened through path_open; borrowed SharedDir descriptors and process stdio are left alone.
+        # The wasi table stays allocated but every entry becomes unusable, so stale Python references cannot be
+        # reused as a task capability.
+        if self._revoked:
+            return
+        self._revoked = True
+        for lease in self._shared_leases:
+            lease.release()
+        self._shared_leases.clear()
+        closed: set[int] = set()
+        for e in self.fd:
+            if e.host_owner != 'task' or e.host_shared:
+                e.wasm_status = self.FILE_STATUS_CLOSED
+                continue
+            if e.host_status != self.FILE_STATUS_OPENED:
+                e.wasm_status = self.FILE_STATUS_CLOSED
+                continue
+            if e.wasm_type != self.FILETYPE_CHARACTER_DEVICE and e.host_fd not in closed:
+                try:
+                    os.close(e.host_fd)
+                    closed.add(e.host_fd)
+                except OSError:
+                    pass
+            e.host_status = self.FILE_STATUS_CLOSED
+            e.wasm_status = self.FILE_STATUS_CLOSED
+
+    def enter(self) -> typing.Self:
+        # Enter this task explicitly. When the task is owned by a Host, this installs it as the active task for
+        # host-function dispatch in the current context.
+        self._require_live()
+        if self._host is not None:
+            if any(e is self for e in self._host._stack.get()):
+                raise TaskConflictError('task is already entered in this context')
+            self._host._push_task(self)
+        return self
+
+    def __enter__(self) -> typing.Self:
+        return self.enter()
+
+    def __exit__(self, exc_type, exc_value, traceback) -> None:
+        self.exit()
+
+    def exit(self) -> None:
+        # Exit this task explicitly and revoke it. Safe to call after proc_exit, normal completion, or an exception,
+        # and idempotent for an already revoked task. Revocation happens even if the exit order is wrong, so a
+        # capability is never left live because of a nesting error.
+        if self._host is not None and any(e is self for e in self._host._stack.get()):
+            try:
+                self._host._pop_task(self)
+            except TaskConflictError:
+                self.revoke()
+                self._host._remove_task(self)
+                raise
+        self.revoke()
 
     def args_get(self, m: pywasm.core.Machine, args: list[int]) -> list[int]:
         # Read command-line argument data. The size of the array should match that returned by args_sizes_get. Each
         # argument is expected to be \0 terminated.
         mems = m.store.mems[m.stack.frame[-1].module.mems[0]]
+        self._require_live()
         argv = args[0]
         argv_buf = args[1]
         for e in self.args:
@@ -496,75 +753,98 @@ class Preview1:
     def args_sizes_get(self, m: pywasm.core.Machine, args: list[int]) -> list[int]:
         # Return command-line argument data sizes.
         mems = m.store.mems[m.stack.frame[-1].module.mems[0]]
+        self._require_live()
         mems.put_u32(args[0], len(self.args))
         mems.put_u32(args[1], sum([len(e) + 1 for e in self.args]))
         return [self.ERRNO_SUCCESS]
 
-    def bind(self, runtime: pywasm.core.Runtime) -> None:
+    @classmethod
+    def signature(cls) -> list[tuple[str, list[pywasm.core.ValType], list[pywasm.core.ValType]]]:
+        # The single source of truth for the preview1 host function ABI. Both direct binding and the shared
+        # multi-task host use this list so their tables can never diverge.
         i32 = pywasm.core.ValType.i32()
         i64 = pywasm.core.ValType.i64()
-        vec = [
-            ['args_get', [i32, i32], [i32], self.args_get],
-            ['args_sizes_get', [i32, i32], [i32], self.args_sizes_get],
-            ['clock_res_get', [i32, i32], [i32], self.clock_res_get],
-            ['clock_time_get', [i32, i64, i32], [i32], self.clock_time_get],
-            ['environ_get', [i32, i32], [i32], self.environ_get],
-            ['environ_sizes_get', [i32, i32], [i32], self.environ_sizes_get],
-            ['fd_advise', [i32, i64, i64, i32], [i32], self.fd_advise],
-            ['fd_allocate', [i32, i64, i64], [i32], self.fd_allocate],
-            ['fd_close', [i32], [i32], self.fd_close],
-            ['fd_datasync', [i32], [i32], self.fd_datasync],
-            ['fd_fdstat_get', [i32, i32], [i32], self.fd_fdstat_get],
-            ['fd_fdstat_set_flags', [i32, i32], [i32], self.fd_fdstat_set_flags],
-            ['fd_fdstat_set_rights', [i32, i64, i64], [i32], self.fd_fdstat_set_rights],
-            ['fd_filestat_get', [i32, i32], [i32], self.fd_filestat_get],
-            ['fd_filestat_set_size', [i32, i64], [i32], self.fd_filestat_set_size],
-            ['fd_filestat_set_times', [i32, i64, i64, i32], [i32], self.fd_filestat_set_times],
-            ['fd_pread', [i32, i32, i32, i64, i32], [i32], self.fd_pread],
-            ['fd_prestat_dir_name', [i32, i32, i32], [i32], self.fd_prestat_dir_name],
-            ['fd_prestat_get', [i32, i32], [i32], self.fd_prestat_get],
-            ['fd_pwrite', [i32, i32, i32, i64, i32], [i32], self.fd_pwrite],
-            ['fd_read', [i32, i32, i32, i32], [i32], self.fd_read],
-            ['fd_readdir', [i32, i32, i32, i64, i32], [i32], self.fd_readdir],
-            ['fd_renumber', [i32, i32], [i32], self.fd_renumber],
-            ['fd_seek', [i32, i64, i32, i32], [i32], self.fd_seek],
-            ['fd_sync', [i32], [i32], self.fd_sync],
-            ['fd_tell', [i32, i32], [i32], self.fd_tell],
-            ['fd_write', [i32, i32, i32, i32], [i32], self.fd_write],
-            ['path_create_directory', [i32, i32, i32], [i32], self.path_create_directory],
-            ['path_filestat_get', [i32, i32, i32, i32, i32], [i32], self.path_filestat_get],
-            ['path_filestat_set_times', [i32, i32, i32, i32, i64, i64, i32], [i32], self.path_filestat_set_times],
-            ['path_link', [i32, i32, i32, i32, i32, i32, i32], [i32], self.path_link],
-            ['path_open', [i32, i32, i32, i32, i32, i64, i64, i32, i32], [i32], self.path_open],
-            ['path_readlink', [i32, i32, i32, i32, i32, i32], [i32], self.path_readlink],
-            ['path_remove_directory', [i32, i32, i32], [i32], self.path_remove_directory],
-            ['path_rename', [i32, i32, i32, i32, i32, i32], [i32], self.path_rename],
-            ['path_symlink', [i32, i32, i32, i32, i32], [i32], self.path_symlink],
-            ['path_unlink_file', [i32, i32, i32], [i32], self.path_unlink_file],
-            ['poll_oneoff', [i32, i32, i32, i32], [i32], self.poll_oneoff],
-            ['proc_exit', [i32], [], self.proc_exit],
-            ['proc_raise', [i32], [i32], self.proc_raise],
-            ['random_get', [i32, i32], [i32], self.random_get],
-            ['sched_yield', [], [i32], self.sched_yield],
-            ['sock_accept', [i32, i32, i32], [i32], self.sock_accept],
-            ['sock_recv', [i32, i32, i32, i32, i32, i32], [i32], self.sock_recv],
-            ['sock_send', [i32, i32, i32, i32, i32], [i32], self.sock_send],
-            ['sock_shutdown', [i32, i32], [i32], self.sock_shutdown],
+        return [
+            ('args_get', [i32, i32], [i32]),
+            ('args_sizes_get', [i32, i32], [i32]),
+            ('clock_res_get', [i32, i32], [i32]),
+            ('clock_time_get', [i32, i64, i32], [i32]),
+            ('environ_get', [i32, i32], [i32]),
+            ('environ_sizes_get', [i32, i32], [i32]),
+            ('fd_advise', [i32, i64, i64, i32], [i32]),
+            ('fd_allocate', [i32, i64, i64], [i32]),
+            ('fd_close', [i32], [i32]),
+            ('fd_datasync', [i32], [i32]),
+            ('fd_fdstat_get', [i32, i32], [i32]),
+            ('fd_fdstat_set_flags', [i32, i32], [i32]),
+            ('fd_fdstat_set_rights', [i32, i64, i64], [i32]),
+            ('fd_filestat_get', [i32, i32], [i32]),
+            ('fd_filestat_set_size', [i32, i64], [i32]),
+            ('fd_filestat_set_times', [i32, i64, i64, i32], [i32]),
+            ('fd_pread', [i32, i32, i32, i64, i32], [i32]),
+            ('fd_prestat_dir_name', [i32, i32, i32], [i32]),
+            ('fd_prestat_get', [i32, i32], [i32]),
+            ('fd_pwrite', [i32, i32, i32, i64, i32], [i32]),
+            ('fd_read', [i32, i32, i32, i32], [i32]),
+            ('fd_readdir', [i32, i32, i32, i64, i32], [i32]),
+            ('fd_renumber', [i32, i32], [i32]),
+            ('fd_seek', [i32, i64, i32, i32], [i32]),
+            ('fd_sync', [i32], [i32]),
+            ('fd_tell', [i32, i32], [i32]),
+            ('fd_write', [i32, i32, i32, i32], [i32]),
+            ('path_create_directory', [i32, i32, i32], [i32]),
+            ('path_filestat_get', [i32, i32, i32, i32, i32], [i32]),
+            ('path_filestat_set_times', [i32, i32, i32, i32, i64, i64, i32], [i32]),
+            ('path_link', [i32, i32, i32, i32, i32, i32, i32], [i32]),
+            ('path_open', [i32, i32, i32, i32, i32, i64, i64, i32, i32], [i32]),
+            ('path_readlink', [i32, i32, i32, i32, i32, i32], [i32]),
+            ('path_remove_directory', [i32, i32, i32], [i32]),
+            ('path_rename', [i32, i32, i32, i32, i32, i32], [i32]),
+            ('path_symlink', [i32, i32, i32, i32, i32], [i32]),
+            ('path_unlink_file', [i32, i32, i32], [i32]),
+            ('poll_oneoff', [i32, i32, i32, i32], [i32]),
+            ('proc_exit', [i32], []),
+            ('proc_raise', [i32], [i32]),
+            ('random_get', [i32, i32], [i32]),
+            ('sched_yield', [], [i32]),
+            ('sock_accept', [i32, i32, i32], [i32]),
+            ('sock_recv', [i32, i32, i32, i32, i32, i32], [i32]),
+            ('sock_send', [i32, i32, i32, i32, i32], [i32]),
+            ('sock_shutdown', [i32, i32], [i32]),
         ]
+
+    def bind(self, runtime: pywasm.core.Runtime) -> None:
+        self._require_live()
+        if self._host is not None:
+            # A host-bound task must not overwrite the host's dispatchers with its own direct methods, otherwise
+            # the next task would inherit this task's arguments and descriptors.
+            if runtime is not self._host.runtime:
+                raise TaskError('host-bound tasks must be bound to the owning host runtime')
+            self._host._ensure_bound()
+            return
+        if getattr(runtime, '_pywasm_wasi_host', None) is not None:
+            raise TaskConflictError('this runtime is owned by a wasi Host; create the task with Host.task(...)')
+        if runtime.imports.get('wasi_snapshot_preview1'):
+            raise TaskConflictError('runtime already has wasi imports; use a fresh Runtime or a Host')
+        self._runtime = runtime
         runtime.imports['wasi_snapshot_preview1'] = {}
-        for e in vec:
-            funkype = pywasm.core.FuncType(e[1], e[2])
-            runtime.imports['wasi_snapshot_preview1'][e[0]] = runtime.allocate_func_host(funkype, e[3])
+        for name, fargs, frets in self.signature():
+            funkype = pywasm.core.FuncType(fargs, frets)
+            runtime.imports['wasi_snapshot_preview1'][name] = runtime.allocate_func_host(
+                funkype, getattr(self, name),
+            )
 
     def clock_res_get(self, m: pywasm.core.Machine, args: list[int]) -> list[int]:
         # Return the resolution of a clock.
         mems = m.store.mems[m.stack.frame[-1].module.mems[0]]
+        self._require_live()
         mems.put_u64(args[1], 1)
         return [self.ERRNO_SUCCESS]
 
     def clock_time_get(self, m: pywasm.core.Machine, args: list[int]) -> list[int]:
         # Return the time value of a clock.
         mems = m.store.mems[m.stack.frame[-1].module.mems[0]]
+        self._require_live()
         mems.put_u64(args[2], self.help_time(args[0]))
         return [self.ERRNO_SUCCESS]
 
@@ -572,6 +852,7 @@ class Preview1:
         # Read environment variable data. The sizes of the buffers should match that returned by environ_sizes_get.
         # Key/value pairs are expected to be joined with =, and terminated with 0.
         mems = m.store.mems[m.stack.frame[-1].module.mems[0]]
+        self._require_live()
         environ = args[0]
         environ_buf = args[1]
         for e in self.envs:
@@ -586,6 +867,7 @@ class Preview1:
     def environ_sizes_get(self, m: pywasm.core.Machine, args: list[int]) -> list[int]:
         # Return environment variable data sizes.
         mems = m.store.mems[m.stack.frame[-1].module.mems[0]]
+        self._require_live()
         mems.put_u32(args[0], len(self.envs))
         mems.put_u32(args[1], sum([len(e) + 1 for e in self.envs]))
         return [self.ERRNO_SUCCESS]
@@ -621,7 +903,7 @@ class Preview1:
         if self.help_badf(args[0]):
             return [self.ERRNO_BADF]
         file = self.fd[args[0]]
-        if file.wasm_type != self.FILETYPE_CHARACTER_DEVICE:
+        if file.host_owner == 'task' and not file.host_shared and file.wasm_type != self.FILETYPE_CHARACTER_DEVICE:
             os.close(file.host_fd)
             file.host_status = self.FILE_STATUS_CLOSED
         file.wasm_status = self.FILE_STATUS_CLOSED
@@ -770,7 +1052,7 @@ class Preview1:
 
     def fd_prestat_dir_name(self, m: pywasm.core.Machine, args: list[int]) -> list[int]:
         # Return a description of the given preopened file descriptor.
-        if self.help_badf(args[0]) or args[0] - 2 > len(self.dirs):
+        if self.help_badf(args[0]) or args[0] not in self._preopen_fds:
             return [self.ERRNO_BADF]
         mems = m.store.mems[m.stack.frame[-1].module.mems[0]]
         file = self.fd[args[0]]
@@ -782,7 +1064,7 @@ class Preview1:
 
     def fd_prestat_get(self, m: pywasm.core.Machine, args: list[int]) -> list[int]:
         # Return a description of the given preopened file descriptor.
-        if self.help_badf(args[0]) or args[0] - 2 > len(self.dirs):
+        if self.help_badf(args[0]) or args[0] not in self._preopen_fds:
             return [self.ERRNO_BADF]
         mems = m.store.mems[m.stack.frame[-1].module.mems[0]]
         file = self.fd[args[0]]
@@ -879,7 +1161,8 @@ class Preview1:
             return [self.ERRNO_BADF]
         stem = self.fd[args[0]]
         dest = self.fd[args[1]]
-        if dest.wasm_type != self.FILETYPE_CHARACTER_DEVICE:
+        if (dest.host_owner == 'task' and not dest.host_shared and
+                dest.wasm_type != self.FILETYPE_CHARACTER_DEVICE and dest.host_fd != stem.host_fd):
             os.close(dest.host_fd)
         dest.host_fd = stem.host_fd
         dest.host_flag = stem.host_flag
@@ -893,6 +1176,9 @@ class Preview1:
         dest.wasm_rights_root = stem.wasm_rights_root
         dest.wasm_status = stem.wasm_status
         dest.wasm_type = stem.wasm_type
+        dest.host_owner = stem.host_owner
+        dest.host_shared = stem.host_shared
+        dest.wasm_read_only = stem.wasm_read_only
         stem.host_status = self.FILE_STATUS_CLOSED
         stem.wasm_status = self.FILE_STATUS_CLOSED
         return [self.ERRNO_SUCCESS]
@@ -970,11 +1256,17 @@ class Preview1:
         mems.put_u32(args[3], size)
         return [self.ERRNO_SUCCESS]
 
+    def help_shared(self, fd: int) -> bool:
+        return self.fd[fd].host_shared or self.fd[fd].wasm_read_only
+
     def help_badf(self, fd: int) -> bool:
+        self._require_live()
         return fd < 0 or fd >= len(self.fd) or self.fd[fd].wasm_status != self.FILE_STATUS_OPENED
 
     def help_escp(self, root: str, name: str) -> bool:
-        return not os.path.normpath(os.path.join(root, name)).startswith(root)
+        root = os.path.normpath(root)
+        target = os.path.normpath(os.path.join(root, name))
+        return os.path.commonpath([root, target]) != root
 
     def help_wasm_type(self, info: os.stat_result) -> int:
         match info.st_mode:
@@ -1018,16 +1310,34 @@ class Preview1:
             case _:
                 return 0
 
-    def main(self, runtime: pywasm.core.Runtime, module: pywasm.core.ModuleInst) -> int:
-        # Attempt to begin execution of instance as a wasi command by invoking its _start() export. If instance does
-        # not contain a _start() export, then an exception is thrown.
+    def main(
+        self,
+        runtime: pywasm.core.Runtime,
+        module: pywasm.core.ModuleInst,
+        func: str = '_start',
+    ) -> int:
+        # Attempt to begin execution of instance as a wasi command by invoking its _start() export (or another
+        # exported function for embedders that use a library entry point). If the export is missing, an exception
+        # is thrown.
+        #
+        # Direct-mode compatibility API: it runs this task and always revokes it in `finally`, so normal completion,
+        # proc_exit, and exceptions all withdraw the capability. A Preview1 object is therefore single-use in direct
+        # mode; embedders that need to run several isolated tasks in one process should use `Host`.
+        if self._revoked:
+            raise TaskRevokedError('wasi task capability has been revoked')
+        if self._host is not None:
+            raise TaskError('host-bound tasks must run through Host.run or Host.invocate')
+        if self._runtime is not None and runtime is not self._runtime:
+            raise TaskConflictError('direct-mode task must run on the runtime it was bound to')
+        task = self
         try:
-            runtime.invocate(module, '_start', [])
-        except Exception as e:
+            task.enter()
+            runtime.invocate(module, func, [])
+        except BaseException as e:
             runtime.machine.stack.frame.clear()
             runtime.machine.stack.label.clear()
             runtime.machine.stack.value.clear()
-            if len(e.args) >= 1 and e.args[0] == SystemExit:
+            if isinstance(e, Exception) and len(e.args) >= 1 and e.args[0] is SystemExit:
                 return e.args[1]
             raise e
         else:
@@ -1036,12 +1346,7 @@ class Preview1:
             for e in self.fd[self.FD_STDOUT: self.FD_STDERR + 1]:
                 if e.pipe:
                     e.pipe.seek(0)
-            for e in self.fd[self.FD_STDERR + 1:]:
-                if e.wasm_type == self.FILETYPE_CHARACTER_DEVICE:
-                    continue
-                if e.host_status != self.FILE_STATUS_CLOSED:
-                    os.close(e.host_fd)
-                    e.host_status = self.FILE_STATUS_CLOSED
+            task.exit()
 
     def path_create_directory(self, m: pywasm.core.Machine, args: list[int]) -> list[int]:
         # Create a directory.
@@ -1052,7 +1357,7 @@ class Preview1:
         mems = m.store.mems[m.stack.frame[-1].module.mems[0]]
         file = self.fd[args[0]]
         name = mems.get(args[1], args[2]).decode()
-        if self.help_escp(file.wasm_name, name):
+        if self.help_escp(file.host_name, name):
             return [self.ERRNO_PERM]
         try:
             os.mkdir(name, dir_fd=file.host_fd)
@@ -1070,7 +1375,7 @@ class Preview1:
         file = self.fd[args[0]]
         flag = args[1]
         name = mems.get(args[2], args[3]).decode()
-        if self.help_escp(file.wasm_name, name):
+        if self.help_escp(file.host_name, name):
             return [self.ERRNO_PERM]
         foll = flag & self.LOOKUPFLAGS_SYMLINK_FOLLOW != 0
         try:
@@ -1101,7 +1406,7 @@ class Preview1:
         file = self.fd[args[0]]
         flag = args[1]
         name = mems.get(args[2], args[3]).decode()
-        if self.help_escp(file.wasm_name, name):
+        if self.help_escp(file.host_name, name):
             return [self.ERRNO_PERM]
         info = os.stat(name, dir_fd=file.host_fd)
         atim = info.st_atime_ns
@@ -1134,9 +1439,9 @@ class Preview1:
         dest = self.fd[args[4]]
         stem_name = mems.get(args[2], args[3]).decode()
         dest_name = mems.get(args[5], args[6]).decode()
-        if self.help_escp(stem.wasm_name, stem_name):
+        if self.help_escp(stem.host_name, stem_name):
             return [self.ERRNO_PERM]
-        if self.help_escp(dest.wasm_name, dest_name):
+        if self.help_escp(dest.host_name, dest_name):
             return [self.ERRNO_PERM]
         foll = args[1] & self.LOOKUPFLAGS_SYMLINK_FOLLOW != 0
         try:
@@ -1164,6 +1469,15 @@ class Preview1:
             return [self.ERRNO_ILSEQ]
         if self.help_escp(file.host_name, name):
             return [self.ERRNO_PERM]
+        read_only = self.help_shared(args[0])
+        if read_only:
+            # A shared preopen and everything descended from it are strictly read-only. WASI expects requested
+            # rights to be masked by the parent's rights rather than rejected, so clamp the request. Creating,
+            # truncating, or appending is refused outright because it would mutate the shared resource.
+            if args[4] & (self.OFLAGS_CREAT | self.OFLAGS_TRUNC) or args[7] & self.FDFLAGS_APPEND:
+                return [self.ERRNO_PERM]
+            args[5] &= self.SHARED_RIGHTS_ROOT
+            args[6] &= self.SHARED_RIGHTS_ROOT
         flag = 0
         if args[1] & self.LOOKUPFLAGS_SYMLINK_FOLLOW == 0:
             flag |= os.O_NOFOLLOW
@@ -1177,12 +1491,15 @@ class Preview1:
             flag |= os.O_TRUNC
             if file.wasm_rights_base & self.RIGHTS_PATH_FILESTAT_SET_SIZE == 0:
                 return [self.ERRNO_PERM]
-        if args[5] & self.RIGHTS_FD_READ + self.RIGHTS_FD_WRITE == self.RIGHTS_FD_READ:
+        if read_only:
             flag |= os.O_RDONLY
-        if args[5] & self.RIGHTS_FD_READ + self.RIGHTS_FD_WRITE == self.RIGHTS_FD_WRITE:
-            flag |= os.O_WRONLY
-        if args[5] & self.RIGHTS_FD_READ + self.RIGHTS_FD_WRITE == self.RIGHTS_FD_READ + self.RIGHTS_FD_WRITE:
-            flag |= os.O_RDWR
+        else:
+            if args[5] & self.RIGHTS_FD_READ + self.RIGHTS_FD_WRITE == self.RIGHTS_FD_READ:
+                flag |= os.O_RDONLY
+            if args[5] & self.RIGHTS_FD_READ + self.RIGHTS_FD_WRITE == self.RIGHTS_FD_WRITE:
+                flag |= os.O_WRONLY
+            if args[5] & self.RIGHTS_FD_READ + self.RIGHTS_FD_WRITE == self.RIGHTS_FD_READ + self.RIGHTS_FD_WRITE:
+                flag |= os.O_RDWR
         if args[7] & self.FDFLAGS_APPEND:
             flag |= os.O_APPEND
         wasm_fd = len(self.fd)
@@ -1242,6 +1559,7 @@ class Preview1:
             wasm_rights_root=rights_root,
             wasm_status=self.FILE_STATUS_OPENED,
             wasm_type=self.help_wasm_type(os.fstat(host_fd)),
+            wasm_read_only=read_only,
         ))
         mems.put_u32(args[8], wasm_fd)
         return [self.ERRNO_SUCCESS]
@@ -1255,7 +1573,7 @@ class Preview1:
         mems = m.store.mems[m.stack.frame[-1].module.mems[0]]
         file = self.fd[args[0]]
         name = mems.get(args[1], args[2]).decode()
-        if self.help_escp(file.wasm_name, name):
+        if self.help_escp(file.host_name, name):
             return [self.ERRNO_PERM]
         try:
             data = os.readlink(name, dir_fd=file.host_fd)
@@ -1275,7 +1593,7 @@ class Preview1:
         mems = m.store.mems[m.stack.frame[-1].module.mems[0]]
         file = self.fd[args[0]]
         name = mems.get(args[1], args[2]).decode()
-        if self.help_escp(file.wasm_name, name):
+        if self.help_escp(file.host_name, name):
             return [self.ERRNO_PERM]
         try:
             os.rmdir(name, dir_fd=file.host_fd)
@@ -1302,9 +1620,9 @@ class Preview1:
         dest = self.fd[args[3]]
         stem_name = mems.get(args[1], args[2]).decode()
         dest_name = mems.get(args[4], args[5]).decode()
-        if self.help_escp(stem.wasm_name, stem_name):
+        if self.help_escp(stem.host_name, stem_name):
             return [self.ERRNO_PERM]
-        if self.help_escp(dest.wasm_name, dest_name):
+        if self.help_escp(dest.host_name, dest_name):
             return [self.ERRNO_PERM]
         try:
             os.rename(stem_name, dest_name, src_dir_fd=stem.host_fd, dst_dir_fd=dest.host_fd)
@@ -1334,9 +1652,9 @@ class Preview1:
         file = self.fd[args[2]]
         stem = mems.get(args[0], args[1]).decode()
         dest = mems.get(args[3], args[4]).decode()
-        if self.help_escp(file.wasm_name, stem):
+        if self.help_escp(file.host_name, stem):
             return [self.ERRNO_PERM]
-        if self.help_escp(file.wasm_name, dest):
+        if self.help_escp(file.host_name, dest):
             return [self.ERRNO_PERM]
         try:
             os.symlink(stem, dest, dir_fd=file.host_fd)
@@ -1357,7 +1675,7 @@ class Preview1:
         mems = m.store.mems[m.stack.frame[-1].module.mems[0]]
         file = self.fd[args[0]]
         name = mems.get(args[1], args[2]).decode()
-        if self.help_escp(file.wasm_name, name):
+        if self.help_escp(file.host_name, name):
             return [self.ERRNO_PERM]
         try:
             os.unlink(name, dir_fd=file.host_fd)
@@ -1371,6 +1689,7 @@ class Preview1:
 
     def poll_oneoff(self, m: pywasm.core.Machine, args: list[int]) -> list[int]:
         # Concurrently poll for the occurrence of a set of events.
+        self._require_live()
         subs = args[0]
         outs = args[1]
         nsub = args[2]
@@ -1448,12 +1767,14 @@ class Preview1:
     def proc_exit(self, _: pywasm.core.Machine, args: list[int]) -> None:
         # Terminate the process normally. An exit code of 0 indicates successful termination of the program. The
         # meanings of other values is dependent on the environment.
+        self._require_live()
         if self.return_on_exit:
             raise Exception(SystemExit, args[0])
         sys.exit(args[0])
 
     def proc_raise(self, _: pywasm.core.Machine, args: list[int]) -> list[int]:
         # Send a signal to the process of the calling thread.
+        self._require_live()
         if args[0] != self.SIGNAL_NONE:
             return [self.ERRNO_INVAL]
         return [self.ERRNO_SUCCESS]
@@ -1461,11 +1782,13 @@ class Preview1:
     def random_get(self, m: pywasm.core.Machine, args: list[int]) -> list[int]:
         # Write high-quality random data into a buffer.
         mems = m.store.mems[m.stack.frame[-1].module.mems[0]]
+        self._require_live()
         mems.put(args[0], bytearray(random.randbytes(args[1])))
         return [self.ERRNO_SUCCESS]
 
     def sched_yield(self, _: pywasm.core.Machine, args: list[int]) -> list[int]:
         # Temporarily yield execution of the calling thread.
+        self._require_live()
         assert len(args) == 0
         return [self.ERRNO_SUCCESS]
 
@@ -1624,3 +1947,168 @@ class Preview1:
                 return [self.ERRNO_CONNABORTED]
             raise e
         return [self.ERRNO_SUCCESS]
+
+
+class Host:
+    # A process-resident host that can run several wasi tasks sequentially while keeping each task's arguments,
+    # environment, preopened directories, and file descriptors isolated.
+    #
+    # Ownership model:
+    #  * The Host owns the pywasm Runtime and the store's host function table.
+    #  * Each task (a Preview1 instance created via `task`) owns the descriptors it opens through path_open and the
+    #    read-write preopened directories declared for it. Those are closed when the task is exited or revoked.
+    #  * Process stdin/stdout/stderr remain owned by the embedding process and are never closed by a task.
+    #  * SharedDir objects are owned by the caller and are borrowed read-only for the lifetime of the tasks that
+    #    declare them. The Host never closes them.
+    #
+    # Dispatch is fail-closed: host functions look up the active task in a context-local variable. If no task is
+    # active or the active task has been revoked, they raise instead of falling back to another task's state.
+    #
+    # enter()/exit() must be properly nested and are intended to be called from the thread running the guest. The
+    # active-task stack is context-local, so sequential tasks never see each other's state. A host is not meant to
+    # run two guest tasks concurrently: the underlying pywasm Runtime has one Machine/Store and therefore one
+    # operand stack and one module instance set. Use one Host per concurrently executing guest.
+
+    def __init__(self, bind_to: pywasm.core.Runtime | None = None) -> None:
+        self.runtime = bind_to if bind_to is not None else pywasm.core.Runtime()
+        self._stack: contextvars.ContextVar[tuple[Preview1, ...]] = contextvars.ContextVar(
+            f'pywasm_wasi_task_stack_{id(self)}', default=(),
+        )
+        self._bound = False
+        self._ensure_bound()
+
+    def _ensure_bound(self) -> None:
+        if self._bound:
+            return
+        owner = getattr(self.runtime, '_pywasm_wasi_host', None)
+        if owner is not None and owner is not self:
+            raise TaskConflictError('this runtime is already owned by another wasi Host')
+        self.runtime._pywasm_wasi_host = self
+        self.runtime.imports['wasi_snapshot_preview1'] = {}
+        for name, fargs, frets in Preview1.signature():
+            funkype = pywasm.core.FuncType(fargs, frets)
+            self.runtime.imports['wasi_snapshot_preview1'][name] = self.runtime.allocate_func_host(
+                funkype, self._dispatch(name),
+            )
+        self._bound = True
+
+    def _dispatch(self, name: str) -> typing.Callable:
+        def host_dispatch(m: pywasm.core.Machine, args: list[int]) -> list[int]:
+            task = self.current_task()
+            if task is None:
+                raise TaskNotActiveError(
+                    f'wasi.{name} called outside an active task; enter a task with Host.task()/Preview1.enter()'
+                )
+            task._require_live()
+            frame = m.stack.frame[-1] if m.stack.frame else None
+            owner = getattr(frame.module, '_wasi_task', None) if frame is not None else None
+            if owner is not None and owner is not task:
+                raise TaskNotActiveError(f'wasi.{name} called from a module owned by another task')
+            return getattr(task, name)(m, args)
+        host_dispatch.__name__ = f'wasi_host_{name}'
+        return host_dispatch
+
+    def current_task(self) -> Preview1 | None:
+        stack = self._stack.get()
+        return stack[-1] if stack else None
+
+    def _push_task(self, task: Preview1) -> None:
+        self._stack.set((*self._stack.get(), task))
+
+    def _pop_task(self, task: Preview1) -> None:
+        stack = self._stack.get()
+        if not stack or stack[-1] is not task:
+            raise TaskConflictError('wasi tasks must be exited in the order they were entered')
+        self._stack.set(stack[:-1])
+
+    def _remove_task(self, task: Preview1) -> None:
+        # Remove a revoked task from anywhere in the stack. Only used after a capability has already been
+        # withdrawn, so no live task is lost and remaining tasks keep their relative order.
+        self._stack.set(tuple(e for e in self._stack.get() if e is not task))
+
+    def task(
+        self,
+        args: list[str],
+        dirs: dict[str, str] | None = None,
+        envs: dict[str, str] | None = None,
+        shared_dirs: dict[str, SharedDir] | list[SharedDir] | None = None,
+    ) -> Preview1:
+        # Create a Preview1 task bound to this host. The caller must use it as a context manager or call
+        # enter()/exit(). Host.task(...) enters automatically when used with `with`.
+        return Preview1(args, dirs or {}, envs or {}, shared_dirs, host=self)
+
+    def task_module(self, task: Preview1, source: str | io.IOBase) -> pywasm.core.ModuleInst:
+        # Instantiate a module and pin it to its task. Module instantiation can run a start function and import
+        # WASI host functions, so it must happen with that task active. The pin also prevents invoking the module
+        # later while another task is active: dispatch checks the module belongs to the current task.
+        task._require_live()
+        if self.current_task() is not task:
+            raise TaskNotActiveError('module instantiation requires its task to be entered first')
+        try:
+            if isinstance(source, str):
+                inst = self.runtime.instance_from_file(source)
+            else:
+                inst = self.runtime.instance_from_reader(source)
+        except Exception:
+            self.runtime.machine.stack.frame.clear()
+            self.runtime.machine.stack.label.clear()
+            self.runtime.machine.stack.value.clear()
+            raise
+        inst._wasi_task = task
+        task._modules.append(inst)
+        return inst
+
+    def run(
+        self,
+        task: Preview1,
+        module: pywasm.core.ModuleInst | str | io.IOBase,
+        func: str = '_start',
+    ) -> int:
+        # Run one task's _start and always revoke it, whether it returns normally, calls proc_exit, or raises.
+        # The module is instantiated inside the task's scope so a start function sees this task, never a previous
+        # one. A fresh module instance also means guest memory and globals do not survive between tasks.
+        with task:
+            try:
+                if isinstance(module, pywasm.core.ModuleInst):
+                    if module not in task._modules or getattr(module, '_wasi_task', None) is not task:
+                        raise TaskNotActiveError(
+                            'module is not pinned to this task; instantiate it with Host.task_module while the '
+                            'task is entered'
+                        )
+                    inst = module
+                elif isinstance(module, str) or isinstance(module, io.IOBase):
+                    inst = self.task_module(task, module)
+                else:
+                    raise TypeError('module must be a ModuleInst, path, or binary stream')
+                self.runtime.invocate(inst, func, [])
+            except BaseException as e:
+                self.runtime.machine.stack.frame.clear()
+                self.runtime.machine.stack.label.clear()
+                self.runtime.machine.stack.value.clear()
+                if isinstance(e, Exception) and len(e.args) >= 1 and e.args[0] is SystemExit:
+                    task.exit_code = e.args[1]
+                else:
+                    raise
+            else:
+                task.exit_code = 0
+            finally:
+                for e in task.fd[task.FD_STDOUT: task.FD_STDERR + 1]:
+                    if e.pipe:
+                        e.pipe.seek(0)
+        return task.exit_code
+
+    def invocate(self, task: Preview1, module: pywasm.core.ModuleInst, func: str, args: list) -> list:
+        # Invoke an exported function of a module pinned to `task`. The task must be entered by the caller. This
+        # enforces the same isolation boundary as run() for commands that use exports other than _start.
+        task._require_live()
+        if module not in task._modules:
+            raise TaskNotActiveError('module is not pinned to the active task')
+        if self.current_task() is not task:
+            raise TaskNotActiveError('task is not the active task')
+        try:
+            return self.runtime.invocate(module, func, args)
+        except BaseException:
+            self.runtime.machine.stack.frame.clear()
+            self.runtime.machine.stack.label.clear()
+            self.runtime.machine.stack.value.clear()
+            raise

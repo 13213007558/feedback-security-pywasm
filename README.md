@@ -76,3 +76,43 @@ However, pywasm's design makes it jit-friendly. Compared to cpython, pywasm's pe
 # License
 
 [MIT](./LICENSE)
+
+# Reusing one host across isolated WASI tasks
+
+`pywasm.wasi.Host` keeps one interpreter runtime and one host-function table while giving every task its own
+arguments, environment, preopened directories, and file-descriptor table. Tasks are entered explicitly and are
+revoked on every exit path: normal return, `proc_exit`, or a guest exception.
+
+```py
+import pywasm
+
+host = pywasm.wasi.Host()
+task = host.task(['app.wasm', '--name', 'second'], {'/data': '/tmp/job-data'}, {'FAKE_SECRET': 'second'})
+exit_code = host.run(task, 'app.wasm')
+assert task.revoked
+```
+
+- `Host()` owns the `pywasm.core.Runtime` and the wasi host function table. It never restarts the process.
+- `Host.task(args, dirs, envs, shared_dirs=...)` snapshots the task inputs. Nothing another task sets is
+  observable: every host function resolves the active task from a context-local stack and fails closed with
+  `TaskNotActiveError`/`TaskRevokedError` when none is active.
+- `Host.run(task, module_or_path, func='_start')` enters the task, instantiates a fresh module instance, invokes
+  the entry point, and always exits in `finally`. `proc_exit` returns its code; other exceptions propagate after
+  the task is revoked. `Host.invocate` runs a non-`_start` export under the same boundary.
+- Use `task.enter()` / `task.exit()` (or `with host.task(...) as task:`) when you need explicit control. `exit()`
+  is idempotent and also revokes. A revoked task raises `TaskRevokedError` if used again; it can never fall back
+  to another task's table. Direct-mode `Preview1` instances remain single-use: `Preview1.main()` revokes them too.
+
+Ownership:
+
+- The host owns the runtime; a task owns descriptors it opens through `path_open` and its read-write preopens,
+  and closes them on revocation. Process `stdin`/`stdout`/`stderr` stay owned by the embedding process.
+- `SharedDir(wasm_name, host_path, owner)` is an explicit, caller-owned, read-only resource. Declare it with
+  `shared_dirs={'/assets': sd}`; tasks borrow a lease and the host never closes it. `SharedDir.close()` refuses
+  while a task lease is active, and everything opened beneath a shared preopen inherits its read-only restriction.
+- Modules are pinned to the task that instantiated them; a module handle cannot be invoked under a different
+  task. One module instance per task also keeps guest memory and globals from surviving between runs.
+- One `Host` runs tasks sequentially. A `pywasm.core.Runtime` has a single machine/store, so use one `Host` per
+  concurrently executing guest. Binding a second `Host` to an already owned runtime raises `TaskConflictError`.
+- CLI usage (`python -m pywasm --wasi preview1 ...`) and the existing `Preview1(args, dirs, envs)` flow still
+  work; those direct-mode instances are single-use because `Preview1.main()` revokes them.
