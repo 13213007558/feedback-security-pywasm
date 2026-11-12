@@ -2,9 +2,11 @@ import ctypes
 import io
 import math
 import pywasm.arith
+import pywasm.budget
 import pywasm.leb128
 import pywasm.log
 import pywasm.opcode
+import contextlib
 import struct
 import typing
 
@@ -1559,6 +1561,43 @@ class Machine:
     def __init__(self) -> None:
         self.store = Store()
         self.stack = Stack()
+        # The active task budget plus the nesting depth of task scopes. The budget is None outside a task, which
+        # keeps the interpreter backwards compatible. A nested scope (for example a host function invoking the
+        # runtime) reuses the active budget instead of replacing it, so re-entry never grants fresh quota.
+        self.budget: pywasm.budget.Budget | None = None
+        self.budget_depth = 0
+
+    def charge(self, cost: int = 1, reason: str = 'instruction') -> None:
+        # Meter work against the active task. Host functions call this for the work they are allowed to do; the
+        # interpreter calls it once per instruction. With no active budget the call is a no-op.
+        if self.budget is not None:
+            self.budget.charge(cost, reason)
+
+    @contextlib.contextmanager
+    def task_scope(self, budget: pywasm.budget.Budget) -> typing.Iterator[pywasm.budget.Budget]:
+        # Run one task under budget, covering its module initialization, every invocation and all host work.
+        # The outermost scope owns the budget and the cleanup: when the budget (or anything else) aborts the
+        # task, the interpreter stack is reset so the next task starts on an empty machine, while the store and
+        # its modules stay usable.
+        if self.budget is not None:
+            # Nested entry: inherit the enclosing task budget and ignore the new one.
+            self.budget_depth += 1
+            try:
+                yield self.budget
+            finally:
+                self.budget_depth -= 1
+            return
+        self.budget = budget
+        self.budget_depth = 1
+        try:
+            yield budget
+        except BaseException:
+            self.stack = Stack()
+            raise
+        finally:
+            self.budget_depth -= 1
+            if self.budget_depth == 0:
+                self.budget = None
 
     def allocate(
         self,
@@ -1709,26 +1748,52 @@ class Machine:
         return newmod
 
     def invocate(self, addr: int, args: list[ValInst]) -> list[ValInst]:
+        # Entry point used by the embedder when no wasm code is running. It requires an empty machine.
+        assert len(self.stack.frame) == 0
+        assert len(self.stack.label) == 0
+        assert len(self.stack.value) == 0
+        rets = self.invocate_reentry(addr, args)
+        assert len(self.stack.frame) == 0
+        assert len(self.stack.label) == 0
+        assert len(self.stack.value) == 0
+        return rets
+
+    def invocate_reentry(self, addr: int, args: list[ValInst]) -> list[ValInst]:
+        # Run a wasm function while other wasm frames are already active, i.e. when a host function calls back
+        # into the runtime. It pushes its own frames and label on top of the suspended call and therefore draws
+        # from the same active task budget; reentry can never install or receive fresh quota.
         func = self.store.func[addr]
         assert func.kind == 0x00
         assert isinstance(func, FuncInst)
         for a, b in zip(func.type.args, args):
             assert a == b.type
-        self.stack.frame.append(Frame(ModuleInst(), LocalsInst([]), 0, 0, 0))
-        pywasm.log.debugln('invocate', addr, args)
+        # Mirror a normal wasm call (see evaluate_call): push one function frame and one label on top of the
+        # suspended caller. The label records the current frame/value depth, so when the function body ends it
+        # pops exactly its own frame and leaves the caller untouched. The nested call shares the active task
+        # budget, so re-entering the runtime can never hand out fresh quota.
         locals = LocalsInst(args)
         for e in func.code.locals:
             locals.data.extend([ValInst.zero(e.type) for _ in range(e.n)])
-        self.stack.frame.append(Frame(func.module, locals, len(func.type.rets), 0, 0))
-        self.stack.label.append(Label(len(func.type.rets), 1, 0, 3, func.code.expr.data, 0))
+        nret = len(func.type.rets)
+        self.stack.frame.append(Frame(
+            func.module,
+            locals,
+            nret,
+            len(self.stack.label),
+            len(self.stack.value),
+        ))
+        self.stack.label.append(Label(
+            nret,
+            len(self.stack.frame) - 1,
+            len(self.stack.value),
+            3,
+            func.code.expr.data,
+            0,
+        ))
         self.evaluate()
-        rets = [self.stack.value.pop() for _ in range(len(func.type.rets))][::-1]
+        rets = [self.stack.value.pop() for _ in range(nret)][::-1]
         for a, b in zip(func.type.rets, rets):
             assert a == b.type
-        self.stack.frame.pop()
-        assert len(self.stack.frame) == 0
-        assert len(self.stack.label) == 0
-        assert len(self.stack.value) == 0
         return rets
 
     def evaluate_br(self, l: int) -> None:
@@ -1821,6 +1886,7 @@ class Machine:
             instr = label.instr[label.index]
             label.index += 1
             pywasm.log.debugln('    ', instr)
+            self.charge(1, f'instruction:{pywasm.opcode.name.get(instr.opcode, instr.opcode)}')
             match instr.opcode:
                 case pywasm.opcode.unreachable:
                     assert 0
@@ -4133,6 +4199,14 @@ class Runtime:
         # Host functions are never allocated by the webassembly semantics itself, but may be allocated by the embedder.
         return Extern(0x00, self.machine.store.allocate_func_host(FuncHost(type, func)))
 
+    @contextlib.contextmanager
+    def task_scope(self, budget: pywasm.budget.Budget) -> typing.Iterator[pywasm.budget.Budget]:
+        # Boundary of one submitted task. Everything done with this runtime inside the with-block draws from the
+        # same cumulative budget, including module initialization, invocations and host functions. When the
+        # budget is exhausted the machine stack is cleaned up and the next task can start normally.
+        with self.machine.task_scope(budget) as active:
+            yield active
+
     def allocate_table(self, type: TableType) -> Extern:
         # Allocate new instances of tables.
         return Extern(0x01, self.machine.store.allocate_table(type))
@@ -4194,3 +4268,19 @@ class Runtime:
         func_rets = self.machine.invocate(func_addr, func_args)
         rets = [e.into_all() for e in func_rets]
         return rets
+
+    def invocate_reentry(
+        self,
+        module: ModuleInst,
+        func: str,
+        args: list[int | float | bytearray]
+    ) -> list:
+        # Call an exported wasm function from inside a host function that is itself running under a task.
+        # The nested call shares the active frames and the active budget, so a host cannot use it to obtain
+        # fresh quota; when the budget is exhausted the nested call traps just like any other instruction.
+        func_addr = [e for e in module.exps if e.name == func][0].data.data
+        func_inst = self.machine.store.func[func_addr]
+        assert len(func_inst.type.args) == len(args)
+        func_args = [ValInst.from_all(a, b) for a, b in zip(func_inst.type.args, args)]
+        func_rets = self.machine.invocate_reentry(func_addr, func_args)
+        return [e.into_all() for e in func_rets]
